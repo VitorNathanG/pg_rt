@@ -8,9 +8,14 @@ services:
       POSTGRES_DB: rt
     ports:
       - "5433:5432"
+    # Parallel workers exchange tuples through /dev/shm, which Docker caps at
+    # 64 MB by default.  A parallel Gather over a full-resolution ray set
+    # overruns that and the render dies with "could not resize shared memory
+    # segment ... No space left on device".
+    shm_size: 1g
     command:
       - postgres
-      # A raytracer is one big recursive CTE; give the executor room to work.
+      # Each bounce is one big set-oriented join; give the executor room.
       - -c
       - work_mem=512MB
       - -c
