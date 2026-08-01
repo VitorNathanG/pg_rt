@@ -106,19 +106,42 @@ CREATE FUNCTION v3_unit(a vec3) RETURNS vec3
 -- Optics --------------------------------------------------------------------
 
 -- Mirror reflection of incident direction d about unit normal n.
+--
+-- Component form, and for the reason given above rather than for taste.  The
+-- vector spelling `d - n * (2.0 * v3_dot(d, n))` hands v3_sub a right operand
+-- costing some twenty operators for a parameter it names three times, so
+-- v3_sub silently stops inlining and every reflection pays a full executor
+-- run.  Written out per component nothing is over the threshold, the dot
+-- product is recomputed three times, and the whole function folds into its
+-- caller -- which is the trade this engine makes everywhere.
 CREATE FUNCTION v3_reflect(d vec3, n vec3) RETURNS vec3
-  AS $$ SELECT d - n * (2.0 * v3_dot(d, n)) $$
+  AS $$ SELECT ROW((d).x - (n).x * (2.0 * v3_dot(d, n)),
+                   (d).y - (n).y * (2.0 * v3_dot(d, n)),
+                   (d).z - (n).z * (2.0 * v3_dot(d, n)))::vec3 $$
   LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- Snell refraction of unit incident d through unit normal n with relative
 -- index eta = n_from / n_into.  NULL signals total internal reflection.
-CREATE FUNCTION v3_refract(d vec3, n vec3, eta float8) RETURNS vec3
-  AS $$
-  SELECT CASE
-    WHEN 1.0 - eta * eta * (1.0 - v3_dot(d, n) * v3_dot(d, n)) < 0.0 THEN NULL
-    ELSE v3_unit(d * eta + n * (eta * (-v3_dot(d, n))
-           - sqrt(1.0 - eta * eta * (1.0 - v3_dot(d, n) * v3_dot(d, n)))))
-  END $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+--
+-- PL/pgSQL, unlike its neighbours, because the component form does not save
+-- this one: the scalar multiplying n is a square root over a discriminant,
+-- and writing it per component names that expression three times, which puts
+-- it straight back over the inlining threshold for v3_unit.  A local binds it
+-- once, and then v3_unit's three arguments are four operators each and the
+-- body folds in.  One PL/pgSQL invocation replaces three executor runs.
+CREATE FUNCTION v3_refract(d vec3, n vec3, eta float8) RETURNS vec3 AS $$
+DECLARE
+  dn float8 := v3_dot(d, n);
+  k  float8;
+  s  float8;
+BEGIN
+  k := 1.0 - eta * eta * (1.0 - dn * dn);
+  IF k < 0.0 THEN RETURN NULL; END IF;      -- total internal reflection
+  s := eta * (-dn) - sqrt(k);
+  RETURN v3_unit((d).x * eta + (n).x * s,
+                 (d).y * eta + (n).y * s,
+                 (d).z * eta + (n).z * s);
+END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
 -- power() raises "value out of range: underflow" rather than returning zero
 -- when the result is subnormal, which a specular exponent in the hundreds hits

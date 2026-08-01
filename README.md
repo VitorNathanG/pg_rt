@@ -21,7 +21,7 @@ triangle meshes, and the tracer does not know which is which.
 ```bash
 docker compose up -d      # PostgreSQL 17
 ./load.sh                 # install the engine and build the default scene
-./test.sh                 # 74 checks on the encoders, the geometry and the optics
+./test.sh                 # 88 checks on the encoders, the geometry and the optics
 ./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
 
@@ -159,7 +159,7 @@ scratch:
 
 ## Performance, and what it cost to find
 
-The engine is written around six measured facts. Each one contradicted the
+The engine is written around seven measured facts. Each one contradicted the
 obvious approach, so they are recorded here rather than rediscovered.
 
 **1. A SQL function body is macro-expanded into its caller.** Writing
@@ -244,6 +244,37 @@ test, so the optimum sits well below it. Measured over the default scene's
 
 `scene_reindex()` defaults to `sqrt(n)/3`, which lands in that basin.
 
+**7. Inlining had silently stopped happening in a dozen places.** Everything
+above rests on FROM-less SQL functions being macro-expanded into the query.
+PostgreSQL refuses when a parameter the body names more than once is handed an
+expression costing more than ten operators, and the refusal is invisible: the
+plan does not change, the row counts do not change, only the clock does.
+
+`auto_explain` with `log_nested_statements = on` finds them, because a SQL
+function body that appears as its own logged statement is precisely one that
+did not inline. A 48×32 frame logged **55 830** such statements — about 36 per
+camera ray. Repairing them brought that to 17 305, of which 96% are aggregate
+transition functions (`cand_min` under `nearest`, `v3_add` under `sum`), which
+are invoked through `fmgr` and can never inline at all. End to end that is
+**1.18×** on the default scene, with bit-identical output.
+
+Two things worth keeping from the audit:
+
+* **Failure cascades.** A call that fails to inline costs `procost 100`, which
+  is itself ten times the threshold — so a single oversized operand un-inlines
+  every operator above it in the expression. `shade`'s diffuse term lost six
+  calls to one `mat_albedo` in the wrong position.
+* **The comment on `cam_dir` was wrong for a long time.** It claimed the camera
+  basis folded to three literal vectors before the query ran. It did not:
+  `v3_unit(cam_from() - cam_at())` is over the threshold, so `cam_w` stayed a
+  live function call, `cam_u` and `cam_v` inherited it, and every camera ray
+  paid four executor runs. It folds now, and there is a test for it.
+
+The repair is always one of two shapes, both already used elsewhere in the
+engine: bind the oversized operand to a PL/pgSQL local so it arrives as a
+`Param`, or write the function in component form so the threshold applies per
+component instead of to the whole vector.
+
 **JIT is off because it was measured, not because it is safer.** These are
 arithmetic-heavy queries over millions of rows, which looks like exactly the
 JIT's target, and it loses badly: +5% at default thresholds, **68× slower**
@@ -267,16 +298,24 @@ default 64 MB `/dev/shm`, which is why `docker-compose.yml` sets `shm_size`.
 `render(..., p_verbose => true)` reports each phase. At 240×160, one sample,
 depth 4, on the default 1118-triangle scene:
 
-| phase | rows | time |
-|---|---|---|
-| bounce 0 | 38 400 | 0.76 s |
-| bounce 1 | 40 571 | 1.08 s |
-| bounce 2 | 33 912 | 1.09 s |
-| bounce 3 | 36 523 | 0.86 s |
-| bounce 4 | 22 698 | 0.53 s |
-| shadow rays | 49 470 | 1.05 s |
-| direct lighting | 101 892 lit hits | 0.39 s |
-| shading and tone mapping | | 1.34 s |
+| phase | rows | before inlining repair | after |
+|---|---|---|---|
+| bounce 0 | 38 400 | 0.37 s | 0.37 s |
+| bounce 1 | 40 571 | 0.48 s | 0.47 s |
+| bounce 2 | 33 912 | 0.47 s | 0.47 s |
+| bounce 3 | 36 523 | 0.39 s | 0.39 s |
+| bounce 4 | 22 698 | 0.23 s | 0.23 s |
+| shadow rays | 49 470 | 0.56 s | 0.51 s |
+| direct lighting | 101 892 lit hits | 0.20 s | 0.19 s |
+| shading and tone mapping | | 0.66 s | 0.40 s |
+| **whole frame** | | **4.90 s** | **4.16 s** |
+
+The two columns were measured back-to-back, so the ratio is meaningful even
+though the absolute numbers are not portable. Note that the phases do not sum
+to the frame: spawning each bounce's child rays happens between the timers and
+is not reported, which is where the rest of the inlining repair landed —
+`child_ray` reaches `v3_reflect` and `v3_refract`, and both of those were
+paying executor runs per ray.
 
 Absolute timings move a great deal with machine state — the same binary and
 scene measured 1.9× faster earlier in the day on this same laptop — so the
@@ -305,7 +344,7 @@ before the inlining work. The BVH is what keeps it from being 40×.
 | `sql/04_scene.sql` | the light table, sky, the default scene |
 | `sql/05_trace.sql` | Fresnel, absorption, direct lighting, ray spawning |
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
-| `test/tests.sql` | 85 checks |
+| `test/tests.sql` | 88 checks |
 | `examples/` | a torus OBJ and the scene that loads it |
 
 ## Notes and limitations

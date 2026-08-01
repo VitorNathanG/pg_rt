@@ -17,6 +17,18 @@ CREATE OR REPLACE FUNCTION near(a float8, b float8, tol float8 DEFAULT 1e-9) RET
   AS $$ SELECT a IS NOT NULL AND b IS NOT NULL AND abs(a - b) <= tol $$
   LANGUAGE sql;
 
+-- The verbose plan of a query, as one string.  Inlining leaves no trace in the
+-- shape of a plan, but it does leave one in the expressions: a function that
+-- folded into its caller stops appearing by name in the Output line.
+CREATE OR REPLACE FUNCTION plan_of(q text) RETURNS text AS $$
+DECLARE r text; acc text := '';
+BEGIN
+  FOR r IN EXECUTE 'EXPLAIN (VERBOSE, COSTS OFF) ' || q LOOP
+    acc := acc || r || E'\n';
+  END LOOP;
+  RETURN acc;
+END $$ LANGUAGE plpgsql;
+
 -- For checking that bad input is refused rather than quietly accepted.  The
 -- failed statement rolls back to this block, so nothing it wrote survives.
 CREATE OR REPLACE FUNCTION raises(stmt text) RETURNS boolean AS $$
@@ -500,6 +512,49 @@ FROM light;
 -- silently producing a NULL that would poison the radiance sum.
 SELECT ok(raises($$INSERT INTO light (name, p) VALUES ('nowhere', ROW(0,0,0)::vec3)$$),
           'a light at the world origin is refused');
+
+\echo
+\echo == inlining ==
+
+-- The engine's whole strategy is that these functions are macro-expanded into
+-- the queries that call them, and PostgreSQL abandons that silently when an
+-- argument gets too big for a parameter the body names more than once.  There
+-- is no plan difference and no row-count difference when it happens -- only a
+-- slower clock -- so it is worth pinning down the two places where the failure
+-- is cheaply visible.
+
+-- The camera basis depends only on IMMUTABLE constants, so it must reduce to
+-- literal vectors before any query executes.  It did not for a long while:
+-- v3_unit over a whole vec3 names its argument twenty-one times, which put
+-- cam_w over the threshold and left the entire basis as live calls.
+SELECT ok(plan_of('SELECT cam_w()') NOT LIKE '%cam_%'
+      AND plan_of('SELECT cam_u()') NOT LIKE '%cam_%'
+      AND plan_of('SELECT cam_v()') NOT LIKE '%cam_%',
+          'the camera basis folds to literal vectors before execution');
+
+-- And cam_dir must fold at the shape the renderer actually calls it: device
+-- coordinates materialised by a LATERAL, so they arrive as plain Vars.  The
+-- `OFFSET 0` is what makes them Vars -- without it the subquery is pulled up,
+-- the arithmetic is spliced back into the argument, and v3_unit stops
+-- inlining again.  That is not hypothetical; it is what this test caught.
+SELECT ok(plan_of($q$SELECT cam_dir(t.nx, t.ny, 1.5)
+                     FROM generate_series(1,1) g,
+                          LATERAL (SELECT g / 10.0, g / 20.0 OFFSET 0)
+                            AS t(nx, ny)$q$)
+            NOT LIKE '%v3_unit%',
+          'cam_dir inlines completely at the renderer''s call shape');
+
+-- The slab and triangle tests are the hot path; if either stops inlining the
+-- engine loses several times more than any tuning gains back.
+SELECT ok(plan_of('SELECT box_hit(t.ox,t.oy,t.oz,t.ivx,t.ivy,t.ivz,
+                                  t.lox,t.loy,t.loz,t.hix,t.hiy,t.hiz)
+                   FROM (SELECT r.ox,r.oy,r.oz,r.ivx,r.ivy,r.ivz,
+                                b.lox,b.loy,b.loz,b.hix,b.hiy,b.hiz
+                         FROM (SELECT 0.0 ox,0.0 oy,0.0 oz,
+                                      1.0 ivx,1.0 ivy,1.0 ivz) r,
+                              mesh_box b) t')
+            NOT LIKE '%box_hit%',
+          'the slab test folds into its caller');
 
 \echo
 \echo == end to end ==

@@ -50,9 +50,17 @@ CREATE FUNCTION sky_bg(d vec3) RETURNS vec3 AS $$
 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- The disc one light paints on the sky, for a ray leaving along d.
+--
+-- The brightness goes through a local because `*` names its scalar operand
+-- three times, once per component, and a pow_safe is well past the size at
+-- which that stops inlining.  Bound first, the scale folds in and this costs
+-- one PL/pgSQL invocation rather than an executor run per escaping ray.
 CREATE FUNCTION sky_sun(d vec3, l light) RETURNS vec3 AS $$
-  SELECT l.col * (l.sky_k * pow_safe(greatest(v3_dot(d, l.sky_dir), 0.0), l.sky_e))
-$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+DECLARE k float8 := l.sky_k
+                  * pow_safe(greatest(v3_dot(d, l.sky_dir), 0.0), l.sky_e);
+BEGIN
+  RETURN l.col * k;
+END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
 -- The sky an escaping ray sees, background plus every visible light disc.
 --

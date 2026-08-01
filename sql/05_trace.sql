@@ -42,8 +42,15 @@ CREATE FUNCTION fresnel_dielectric(cosi float8, eta float8) RETURNS float8 AS $$
 
 -- Metals reflect with a per-channel tint, so their Fresnel term is a vec3
 -- whose normal-incidence value is the tint itself.
+--
+-- Component form: the vector spelling hands `*` a Schlick term for a scalar
+-- operand it names three times, which is over the inlining threshold, so the
+-- addition above it stops folding too.  Written out, pow_safe sees a one
+-- operator base and the whole expression collapses into the caller.
 CREATE FUNCTION fresnel_metal(cosi float8, tint vec3) RETURNS vec3 AS $$
-  SELECT tint + (ROW(1, 1, 1)::vec3 - tint) * pow_safe(1.0 - cosi, 5.0)
+  SELECT ROW((tint).x + (1.0 - (tint).x) * pow_safe(1.0 - cosi, 5.0),
+             (tint).y + (1.0 - (tint).y) * pow_safe(1.0 - cosi, 5.0),
+             (tint).z + (1.0 - (tint).z) * pow_safe(1.0 - cosi, 5.0))::vec3
 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- Index of refraction for the wavelength a ray has been committed to.  An
@@ -105,13 +112,19 @@ DECLARE
   lv   vec3   := l.p - (h).p;
   dist float8 := v3_len(lv);
   ld   vec3   := lv * (1.0 / dist);
+  hv   vec3;
+  ndl  float8;
   cs   float8;
 BEGIN
   IF m.kind = mat_diffuse() THEN
-    RETURN l.col * (l.pow / (dist * dist) * greatest(v3_dot((h).n, ld), 0.0))
-         * sh;
+    ndl := greatest(v3_dot((h).n, ld), 0.0);
+    RETURN l.col * (l.pow / (dist * dist) * ndl) * sh;
   END IF;
-  cs := greatest(v3_dot((h).n, v3_unit(ld - d)), 0.0);
+  -- The half vector goes through a local as well: v3_dot names each of its
+  -- arguments three times, and v3_unit expanded in place is far past the
+  -- point where that stops inlining.
+  hv := v3_unit(ld - d);
+  cs := greatest(v3_dot((h).n, hv), 0.0);
   RETURN l.col * pow_safe(cs, m.spec_e) * sh;
 END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
@@ -125,12 +138,13 @@ END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 -- thresholds light_rad's answer rounds away, so the renderer sums only what
 -- survives here.
 CREATE FUNCTION wants_light(d vec3, h hit, m material, l light) RETURNS boolean AS $$
-DECLARE ld vec3; cs float8;
+DECLARE ld vec3; hv vec3; cs float8;
 BEGIN
   IF (h).mat = 0 THEN RETURN false; END IF;
   ld := v3_unit(l.p - (h).p);
   IF m.kind = mat_diffuse() THEN RETURN v3_dot((h).n, ld) > 0.0; END IF;
-  cs := greatest(v3_dot((h).n, v3_unit(ld - d)), 0.0);
+  hv := v3_unit(ld - d);                    -- local: see light_rad
+  cs := greatest(v3_dot((h).n, hv), 0.0);
   RETURN pow_safe(cs, m.spec_e) >= 1e-4;
 END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
@@ -146,20 +160,37 @@ END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 -- no lights in it.
 -- ---------------------------------------------------------------------------
 
+-- Every vec3 below goes through a local before it is combined with another.
+-- That is not stylistic: a vec3 operator names each operand three times, so
+-- handing one the result of sky_bg or mat_albedo is over the inlining
+-- threshold, and a call that fails to inline costs procost 100 -- which is
+-- itself over the threshold, so the failure cascades up the whole expression.
+-- Bound to locals every operand is a Param, and the entire arithmetic folds
+-- into one expression tree with no calls in it.
 CREATE FUNCTION shade(d vec3, h hit, att vec3, m material, e vec3) RETURNS vec3 AS $$
+DECLARE
+  bg   vec3;
+  alb  vec3;
+  lit  vec3;
+  fres float8;
 BEGIN
   -- Miss: the ray escapes and picks up the sky it was pointing at.  The light
   -- discs painted on that sky are in `e` as well -- looking at a light is the
   -- one way a miss is lit.
-  IF (h).mat = 0 THEN RETURN att * (sky_bg(d) + e); END IF;
+  IF (h).mat = 0 THEN
+    bg := sky_bg(d);
+    RETURN att * (bg + e);
+  END IF;
 
   IF m.kind = mat_diffuse() THEN
     -- Lambertian diffuse under the lights plus a sky fill term.  The (1 - kr)
     -- factor is the energy *not* handed to the reflection child.
-    RETURN att * mat_albedo(m, (h).p)
-               * (e + sky_bg((h).n) * 0.09)
-               * (1.0 - least(m.kr_max,
-                              fresnel_schlick(-v3_dot(d, (h).n), m.f0)));
+    alb  := mat_albedo(m, (h).p);
+    bg   := sky_bg((h).n);
+    fres := 1.0 - least(m.kr_max,
+                        fresnel_schlick(-v3_dot(d, (h).n), m.f0));
+    lit  := att * alb * (e + bg * 0.09);
+    RETURN lit * fres;
   END IF;
 
   -- Metal and glass contribute only a specular highlight locally; their
@@ -184,17 +215,27 @@ DECLARE
   eta  float8;
   dir  vec3;
   a    vec3;
+  kr   float8;
+  tint vec3;
 BEGIN
   -- Branch 0: specular reflection off whichever surface was hit.
+  --
+  -- Each Fresnel term lands in a scalar local first.  Handed straight to the
+  -- `*` operator it is an eight-to-twelve operator expression against a
+  -- parameter named three times, which is over the threshold and costs an
+  -- executor run per child ray -- see the note on shade.
   IF k = 0 THEN
     IF m.kind = mat_diffuse() THEN
-      a := att * least(m.kr_max, fresnel_schlick(cosi, m.f0));
+      kr := least(m.kr_max, fresnel_schlick(cosi, m.f0));
+      a  := att * kr;
     ELSIF m.kind = mat_metal() THEN
-      a := att * fresnel_metal(cosi, m.tint);
+      tint := fresnel_metal(cosi, m.tint);
+      a    := att * tint;
     ELSE
       eta := CASE WHEN (h).back THEN ior_of(m, chan)
                   ELSE 1.0 / ior_of(m, chan) END;
-      a := att * fresnel_dielectric(cosi, eta);
+      kr  := fresnel_dielectric(cosi, eta);
+      a   := att * kr;
     END IF;
     RETURN ROW((h).p + (h).n * 1e-4, v3_reflect(d, (h).n), a, chan)::ray;
   END IF;
@@ -209,7 +250,11 @@ BEGIN
   dir := v3_refract(d, (h).n, eta);
   IF dir IS NULL THEN RETURN NULL; END IF;        -- total internal reflection
 
-  a := att * (1.0 - fresnel_dielectric(cosi, eta));
-  IF chan = 0 THEN a := a * chan_mask(k); END IF;
+  kr := 1.0 - fresnel_dielectric(cosi, eta);
+  a  := att * kr;
+  IF chan = 0 THEN
+    tint := chan_mask(k);
+    a    := a * tint;
+  END IF;
   RETURN ROW((h).p - (h).n * 1e-4, dir, a, k)::ray;
 END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;

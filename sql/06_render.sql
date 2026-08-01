@@ -7,20 +7,42 @@ CREATE FUNCTION cam_at()   RETURNS vec3   AS $$ SELECT ROW(0.05, 1.00, 0.00)::ve
 CREATE FUNCTION cam_fov()  RETURNS float8 AS $$ SELECT 44.0 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- Direction through a point on the image plane.  nx and ny are normalised
--- device coordinates in [-1, 1], with ny pointing up.  The basis depends only
--- on IMMUTABLE constants, so the planner folds it to three literal vectors
--- before the query executes.
+-- device coordinates in [-1, 1], with ny pointing up.
+--
+-- The basis depends only on IMMUTABLE constants, so the planner *should* fold
+-- it to three literal vectors before the query executes -- and for a long time
+-- this claimed it did while it did not.  `v3_unit(cam_from() - cam_at())`
+-- hands v3_unit an argument for a parameter its body names twenty-one times,
+-- which stops it inlining; unable to inline, the planner cannot fold it
+-- either, so cam_w stayed a live function call, cam_u and cam_v inherited it,
+-- and cam_dir cost four executor runs per camera ray.  Nothing showed it but
+-- auto_explain's nested-statement log.
+--
+-- The component form of v3_unit takes three separate parameters, so the
+-- threshold applies per component and each argument here is a constant fold
+-- away from nothing.  With cam_w foldable the whole basis collapses, and
+-- cam_dir below is then pure arithmetic over literals.
 CREATE FUNCTION cam_w() RETURNS vec3
-  AS $$ SELECT v3_unit(cam_from() - cam_at()) $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+  AS $$ SELECT v3_unit((cam_from()).x - (cam_at()).x,
+                       (cam_from()).y - (cam_at()).y,
+                       (cam_from()).z - (cam_at()).z) $$
+  LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 CREATE FUNCTION cam_u() RETURNS vec3
-  AS $$ SELECT v3_unit(v3_cross(ROW(0,1,0)::vec3, cam_w())) $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+  AS $$ SELECT v3_unit((v3_cross(ROW(0,1,0)::vec3, cam_w())).x,
+                       (v3_cross(ROW(0,1,0)::vec3, cam_w())).y,
+                       (v3_cross(ROW(0,1,0)::vec3, cam_w())).z) $$
+  LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 CREATE FUNCTION cam_v() RETURNS vec3
   AS $$ SELECT v3_cross(cam_w(), cam_u()) $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 CREATE FUNCTION cam_dir(nx float8, ny float8, aspect float8) RETURNS vec3 AS $$
-  SELECT v3_unit(cam_u() * (nx * aspect * tan(radians(cam_fov()) / 2.0))
-               + cam_v() * (ny * tan(radians(cam_fov()) / 2.0))
-               - cam_w())
+  SELECT v3_unit(
+    (cam_u()).x * (nx * aspect * tan(radians(cam_fov()) / 2.0))
+      + (cam_v()).x * (ny * tan(radians(cam_fov()) / 2.0)) - (cam_w()).x,
+    (cam_u()).y * (nx * aspect * tan(radians(cam_fov()) / 2.0))
+      + (cam_v()).y * (ny * tan(radians(cam_fov()) / 2.0)) - (cam_w()).y,
+    (cam_u()).z * (nx * aspect * tan(radians(cam_fov()) / 2.0))
+      + (cam_v()).z * (ny * tan(radians(cam_fov()) / 2.0)) - (cam_w()).z)
 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- Extended Reinhard tone mapping followed by a gamma 2.2 transfer, quantised
@@ -30,13 +52,19 @@ $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 CREATE FUNCTION tone_white() RETURNS float8
   AS $$ SELECT 3.4 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
+-- PL/pgSQL for the exposed radiance, which the tone curve names three times.
+-- Spelled as one expression it is well past the point where pow_safe -- whose
+-- body names its base three times in turn -- stops inlining, so every channel
+-- of every pixel paid a full executor run for a logarithm and an exponential.
+-- One local removes it: `l` is a Param, pow_safe folds in, and what is left is
+-- a single PL/pgSQL invocation per channel.
 CREATE FUNCTION quantize(v float8, exposure float8) RETURNS int AS $$
-  SELECT least(255, greatest(0, round(255.0 * pow_safe(
-           greatest(v, 0.0) * exposure
-             * (1.0 + greatest(v, 0.0) * exposure / (tone_white() * tone_white()))
-             / (1.0 + greatest(v, 0.0) * exposure),
-           1.0 / 2.2))::int))
-$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+DECLARE l float8 := greatest(v, 0.0) * exposure;
+BEGIN
+  RETURN least(255, greatest(0, round(255.0 * pow_safe(
+           l * (1.0 + l / (tone_white() * tone_white())) / (1.0 + l),
+           1.0 / 2.2))::int));
+END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
 -- ---------------------------------------------------------------------------
 -- render: trace the scene and leave the result in the table `img`.
@@ -113,10 +141,18 @@ BEGIN
        generate_series(0, img_h - 1) AS gy(py),
        generate_series(0, aa - 1) AS sx(i),
        generate_series(0, aa - 1) AS sy(j),
-       LATERAL (SELECT cam_dir(
-                  2.0 * ((gx.px + (sx.i + 0.5) / aa) / img_w) - 1.0,
-                  1.0 - 2.0 * ((gy.py + (sy.j + 0.5) / aa) / img_h),
-                  img_w::float8 / img_h) OFFSET 0) AS cr(dir);
+       -- The device coordinates are materialised before cam_dir sees them,
+       -- and that is load-bearing rather than tidy.  cam_dir's body reaches
+       -- v3_unit, which names each component three times; spelled inline
+       -- these two expressions push that argument past the point where
+       -- PostgreSQL will inline, and the camera ray costs a whole executor
+       -- run per sample.  As Vars they cost nothing to duplicate and the
+       -- entire camera folds to arithmetic over literals.
+       LATERAL (SELECT 2.0 * ((gx.px + (sx.i + 0.5) / aa) / img_w) - 1.0,
+                       1.0 - 2.0 * ((gy.py + (sy.j + 0.5) / aa) / img_h)
+                OFFSET 0) AS nd(nx, ny),
+       LATERAL (SELECT cam_dir(nd.nx, nd.ny, img_w::float8 / img_h)
+                OFFSET 0) AS cr(dir);
   ALTER TABLE rt_ray SET (parallel_workers = 4);
   ANALYZE rt_ray;
 
