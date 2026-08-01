@@ -143,6 +143,32 @@ inside each iteration becomes an ordinary aggregating join. The loop is
 bounded by `maxdepth` and exits early when no rays survive the throughput
 cutoff.
 
+### Three levels of bounding volume, one join each
+
+The mesh box rejects whole objects, the BVH leaf rejects clusters of triangles,
+the triangle's own box rejects the triangle, and only what survives all three
+reaches Möller–Trumbore. Leaves are runs of Morton-ordered triangles, which
+keeps them spatially compact. `scene_reindex()` rebuilds all of it and must be
+called after any change to geometry.
+
+The tree is two built levels deep because the number of join levels has to be
+written into the query text — see [`research/bvh.md`](research/bvh.md) for the
+leaf-size measurements and the third level that was built and rejected.
+
+### Leaf math is written to be inlined
+
+PostgreSQL inlines a SQL function whose body is a single `SELECT` with no
+`FROM`, substituting it into the caller's expression tree so that no call
+happens at runtime. Essentially every performance decision in the engine
+follows from that, including some that look strange in isolation: the `OFFSET
+0` fences on the LATERAL joins, the flat `float8` mirror columns beside every
+stored `vec3`, and the split between what is written in SQL and what is written
+in PL/pgSQL.
+
+It is worth reading [`research/inlining.md`](research/inlining.md) before
+changing any of it, because inlining fails **silently** — same plan, same row
+counts, only a slower clock.
+
 ### The PNG is built byte by byte in SQL
 
 PostgreSQL exposes no zlib binding to SQL, so the container is assembled from
@@ -157,182 +183,30 @@ scratch:
   DEFLATE block, so the output is a fully conformant PNG that stock decoders
   read; it is simply about as large as the raw pixel data.
 
-## Performance, and what it cost to find
+## Performance
 
-The engine is written around seven measured facts. Each one contradicted the
-obvious approach, so they are recorded here rather than rediscovered.
+A 240×160 frame with 2×2 samples and depth 5 renders the default 1118-triangle
+scene in about 15 s on a laptop in Docker; full HD at one sample takes about
+4½ minutes. Absolute numbers travel badly — the same binary measured 1.9×
+faster on the same machine after a power-profile change — so the write-ups
+below deal in ratios, measured back-to-back. Most of them contradicted the
+obvious approach, which is why they are recorded rather than rediscovered:
 
-**1. A SQL function body is macro-expanded into its caller.** Writing
-
-```sql
-LATERAL (SELECT child_ray(...)) AS c(r)
-```
-
-and then reading `(c.r).o`, `(c.r).d`, `(c.r).att`, `(c.r).chan` substitutes
-the *entire call* at every one of those references. This is why `OFFSET 0`
-appears on the LATERAL joins — it is an optimisation fence that blocks
-subquery pull-up — and why leaf math has no `FROM` clause (PostgreSQL only
-inlines a SQL function whose body is a single `SELECT` with an empty range
-table), while anything reusing an intermediate is PL/pgSQL. In the
-fixed-geometry version this trap alone took a 120×80 render from *over two
-minutes* to 0.76 s.
-
-**2. The fence is not always enough — a ray must carry its inverse direction
-as a real column.** Computing it in a `LATERAL` looks equivalent, but the
-planner pulls a single-row `Result` up into the join filter, and the slab test
-mentions the inverse direction twelve times. `EXPLAIN` showed the entire
-`ROW(1/nz(...), ...)` expression, with its three divisions, repeated twelve
-times inside one box test.
-
-**3. An inlined expression node costs ~2.5 ns; a PL/pgSQL statement ~45 ns.**
-Eighteen times. That crossover is far past where it looks: a fully inlined
-Möller–Trumbore with ~90 duplicated expression nodes beats the PL/pgSQL
-version by 5×, so `tri_hit` is FROM-less SQL over precomputed edges. A
-`(v).x` FieldSelect on a composite costs ~10 ns against ~1 ns for a plain
-`float8` Var, and the inlined slab and triangle tests name their arguments
-some sixty times between them — which is why `tri`, `bvh_node`, `mesh_box`
-and the ray tables all carry a flat `float8` mirror of their vectors as
-`GENERATED ALWAYS ... STORED` columns. Measured over the 460 304 candidate
-pairs of one 240×160 frame: box test 387 → 106 ns, triangle test 1601 → 290 ns.
-
-**4. Inlining fails silently when an argument is expensive.** `inline_function`
-refuses when a parameter the body names more than once is passed an
-expression costing more than `10 * cpu_operator_cost`. The function then runs
-as a real SQL function — a full executor run, microseconds — and **`EXPLAIN`
-shows nothing unusual**. Only timing does. Three instances were live in this
-code: `tri_shading_normal(t, tri_bary(...))` was 900 ms of a 1347 ms query
-from that cause alone. The escapes are to assign the argument to a PL/pgSQL
-local (it becomes a `Param`, cost 0) or to pass components rather than a
-composite. This is the exact mirror of fact 1: there, naming a value twice
-made it compute twice; here, naming it twice stops it inlining at all.
-
-**5. The executor beats interpreted PL/pgSQL, but only in the right shape.**
-Two comparisons, each between shapes doing identical work.
-
-4000 rays against 512 triangles, no acceleration:
-
-| shape | time |
+| | |
 |---|---|
-| set-based join, one PL/pgSQL call per (ray, triangle) | **145 ms** |
-| PL/pgSQL loop over the same geometry held in an array | 1311 ms |
+| [`research/inlining.md`](research/inlining.md) | The rule the whole engine rests on, and how to audit it when it silently stops applying |
+| [`research/query-shape.md`](research/query-shape.md) | Joins against loops, CTAS against INSERT, and why JIT is off |
+| [`research/bvh.md`](research/bvh.md) | Leaf sizing, the triangle box, and the level that was rejected |
+| [`research/timings.md`](research/timings.md) | Per-phase and per-resolution breakdowns, and what a full HD frame costs in bytes |
 
-16 000 rays against the 514-triangle scene:
+`render(..., p_verbose => true)` reports each phase as it goes, which is the
+quickest way to see where a particular scene is spending its time.
 
-| shape | time |
-|---|---|
-| set-based join through the BVH | **388 ms** |
-| per-ray correlated subquery through the BVH | 1097 ms |
-| every ray against every triangle, `DISTINCT ON` for the nearest | 10 036 ms |
-
-The first pair says a per-ray tree walk with an explicit stack — the textbook
-BVH traversal — is the *wrong* design here: interpreted loop iterations cost
-more than the triangle tests they skip. The second says the reduction must not
-sort. Hence a two-level hierarchy expressed as a chain of joins, closed by an
-aggregate.
-
-**6. Leaf size is not sqrt(n).** A triangle test costs about three times a box
-test, so the optimum sits well below it. Measured over the default scene's
-1104-triangle ball:
-
-| leaf size | leaves | triangles tested per ray | time |
-|---|---|---|---|
-| 4 | 280 | 6.5 | 905 ms |
-| **8** | **141** | **10.0** | **798 ms** |
-| 12 | 94 | 12.1 | 810 ms |
-| 20 | 58 | 18.8 | 1025 ms |
-| 40 | 30 | 30.1 | 1446 ms |
-
-`scene_reindex()` defaults to `sqrt(n)/3`, which lands in that basin.
-
-**7. Inlining had silently stopped happening in a dozen places.** Everything
-above rests on FROM-less SQL functions being macro-expanded into the query.
-PostgreSQL refuses when a parameter the body names more than once is handed an
-expression costing more than ten operators, and the refusal is invisible: the
-plan does not change, the row counts do not change, only the clock does.
-
-`auto_explain` with `log_nested_statements = on` finds them, because a SQL
-function body that appears as its own logged statement is precisely one that
-did not inline. A 48×32 frame logged **55 830** such statements — about 36 per
-camera ray. Repairing them brought that to 17 305, of which 96% are aggregate
-transition functions (`cand_min` under `nearest`, `v3_add` under `sum`), which
-are invoked through `fmgr` and can never inline at all. End to end that is
-**1.18×** on the default scene, with bit-identical output.
-
-Two things worth keeping from the audit:
-
-* **Failure cascades.** A call that fails to inline costs `procost 100`, which
-  is itself ten times the threshold — so a single oversized operand un-inlines
-  every operator above it in the expression. `shade`'s diffuse term lost six
-  calls to one `mat_albedo` in the wrong position.
-* **The comment on `cam_dir` was wrong for a long time.** It claimed the camera
-  basis folded to three literal vectors before the query ran. It did not:
-  `v3_unit(cam_from() - cam_at())` is over the threshold, so `cam_w` stayed a
-  live function call, `cam_u` and `cam_v` inherited it, and every camera ray
-  paid four executor runs. It folds now, and there is a test for it.
-
-The repair is always one of two shapes, both already used elsewhere in the
-engine: bind the oversized operand to a PL/pgSQL local so it arrives as a
-`Param`, or write the function in component form so the threshold applies per
-component instead of to the whole vector.
-
-**JIT is off because it was measured, not because it is safer.** These are
-arithmetic-heavy queries over millions of rows, which looks like exactly the
-JIT's target, and it loses badly: +5% at default thresholds, **68× slower**
-with the thresholds at zero, and 3× slower *after* the optimisations above,
-because the newly inlined kernels grew past `jit_above_cost`. The penalty is
-a roughly constant 4.5–5 s per render regardless of resolution — `render()`
-issues a fixed number of distinct queries and each is compiled once per
-execution — so there is no crossover at which it pays back.
-
-A smaller effect, kept because it is free: every ray set is built with
-`CREATE TABLE AS` rather than `INSERT INTO`. PostgreSQL refuses to parallelise
-any statement that writes, with CTAS as the one exception — the identical
-query gets a `Gather` as a CTAS and none at all as an `INSERT ... SELECT`.
-Worth about 9%; the planner still assigns only one worker, because it sizes
-workers by page count and a ray table is small no matter how much arithmetic
-each row costs. Parallel workers also need more shared memory than Docker's
-default 64 MB `/dev/shm`, which is why `docker-compose.yml` sets `shm_size`.
-
-### Where the time goes
-
-`render(..., p_verbose => true)` reports each phase. At 240×160, one sample,
-depth 4, on the default 1118-triangle scene:
-
-| phase | rows | before inlining repair | after |
-|---|---|---|---|
-| bounce 0 | 38 400 | 0.37 s | 0.37 s |
-| bounce 1 | 40 571 | 0.48 s | 0.47 s |
-| bounce 2 | 33 912 | 0.47 s | 0.47 s |
-| bounce 3 | 36 523 | 0.39 s | 0.39 s |
-| bounce 4 | 22 698 | 0.23 s | 0.23 s |
-| shadow rays | 49 470 | 0.56 s | 0.51 s |
-| direct lighting | 101 892 lit hits | 0.20 s | 0.19 s |
-| shading and tone mapping | | 0.66 s | 0.40 s |
-| **whole frame** | | **4.90 s** | **4.16 s** |
-
-The two columns were measured back-to-back, so the ratio is meaningful even
-though the absolute numbers are not portable. Note that the phases do not sum
-to the frame: spawning each bounce's child rays happens between the timers and
-is not reported, which is where the rest of the inlining repair landed —
-`child_ray` reaches `v3_reflect` and `v3_refract`, and both of those were
-paying executor runs per ray.
-
-Absolute timings move a great deal with machine state — the same binary and
-scene measured 1.9× faster earlier in the day on this same laptop — so the
-table below gives before and after **measured back-to-back in one session**.
-Only the ratio carries across machines.
-
-| resolution | samples | depth | before | after |
-|---|---|---|---|---|
-| 120×80 | 1 | 4 | 5.6 s | **2.6 s** |
-| 240×160 | 1 | 4 | 22.0 s | **10.1 s** |
-| 480×320 | 2×2 | 5 | — | 144 s |
-| 600×400 | 2×2 | 5 | — | 243 s |
-
-Against the fixed-geometry version this replaced — three analytic primitives
-per ray, no mesh at all — the same frame measures 5.98 s to this engine's
-10.1 s, so general geometry now costs **1.7×** rather than the 3.7× it cost
-before the inlining work. The BVH is what keeps it from being 40×.
+Three settings are worth knowing about because they are not defaults: `jit` is
+**off** (it measured 3× slower here), every ray set is built with `CREATE TABLE
+AS` rather than `INSERT INTO` (PostgreSQL will not parallelise a writing
+statement, and CTAS is the one exception), and `docker-compose.yml` raises
+`shm_size` because parallel workers need more than Docker's default 64 MB.
 
 ## Layout
 
@@ -346,6 +220,7 @@ before the inlining work. The BVH is what keeps it from being 40×.
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
 | `test/tests.sql` | 88 checks |
 | `examples/` | a torus OBJ and the scene that loads it |
+| [`research/`](research) | the measurements behind the design |
 
 ## Notes and limitations
 
@@ -366,12 +241,9 @@ before the inlining work. The BVH is what keeps it from being 40×.
   but placing those samples well needs a PRNG, and `random()` is `VOLATILE` and
   would break the planner's assumptions, so it would have to be a hash of the
   ray index.
-* A light costs one shadow ray per hit it can reach, so cost is linear in the
-  light count where it is not free: measured at 240×160, going from one light
-  to three took the shadow pass from 2.1 s to 6.5 s and the whole frame from
-  17.8 s to 22.4 s. The shading pass does not move at all (2.5 s in both),
-  because everything that depends only on the surface is computed once per hit
-  regardless of how many lights reach it.
+* A light costs one shadow ray per hit it can reach, so render time is linear
+  in the light count — but only in the shadow pass, not in shading. Numbers in
+  [`research/timings.md`](research/timings.md).
 * The ground plane's Fresnel reflectance is capped below its physical value.
   Uncapped, a grazing-angle mirror floor reflects the bright uniform sky
   across the whole lower frame and erases its own shadows.
