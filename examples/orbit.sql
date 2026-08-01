@@ -36,6 +36,12 @@ FROM generate_series(0, 23) AS i;
 -- the work queue, and a frame that already has its bytes is simply not in it.
 SELECT count(*) AS frames_to_render FROM frame WHERE png IS NULL;
 
+-- One session, in frame order.  For the same twenty-four frames through the
+-- same queue with several sessions pulling from it -- 144 s here against 37 s
+-- at eight, for identical bytes -- stop after the INSERT above and run
+--
+--   ./render_frames.sh 8
+--
 SELECT render_frame(frame_id)
 FROM frame
 WHERE name LIKE 'orbit-%' AND png IS NULL

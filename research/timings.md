@@ -191,6 +191,11 @@ session, wall clock for all of them:
 | 4 | 11.68 s | 2.92 s | 3.00× |
 | 8 | 17.33 s | 2.17 s | 4.04× |
 
+and end to end on the orbit example, 24 frames at 320×200: **144 s serially,
+80 s at two, 50 s at four, 37 s at eight** — 3.9×, byte-identical to the
+serial run. Ten cores, so the curve flattening between four and eight is the
+machine, not the queue.
+
 ### The design that keeps the workers is not worth it
 
 The alternative is a schema per backend PID put in front of `public` on the

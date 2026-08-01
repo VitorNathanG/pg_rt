@@ -96,3 +96,44 @@ BEGIN
   END IF;
   RETURN render_frame(fid, p_verbose);
 END $$ LANGUAGE plpgsql;
+
+-- ---------------------------------------------------------------------------
+-- Take one unrendered frame and render it, or return NULL if there are none.
+--
+-- This is the whole of the parallel driver's server side.  `frame` was already
+-- a work queue -- `WHERE png IS NULL` is the backlog, and that is how an
+-- interrupted sequence resumes -- so making it a *concurrent* queue needs only
+-- the one clause SQL has had since 9.5.  FOR UPDATE takes a row lock that is
+-- held until the transaction ends, which here is until the frame is traced and
+-- stored; SKIP LOCKED steps over rows another session is already tracing
+-- instead of waiting behind them.  N sessions calling this in a loop therefore
+-- pull disjoint frames with no coordination between them, and a session that
+-- dies mid-frame drops its lock and its uncommitted UPDATE together, putting
+-- the frame straight back in the queue.
+--
+-- LIMIT after a locking clause reads like a race and is not one: the plan puts
+-- LockRows below Limit, so the skipping happens first and the limit takes the
+-- first row that was actually claimed.
+--
+-- Calling it from psql one statement at a time is deliberate -- each call is
+-- its own transaction, so each frame commits as it finishes.  Wrapping the
+-- loop in a DO block would hold every lock and every PNG until the last frame
+-- was done, which is the opposite of what a resumable queue is for.
+-- ---------------------------------------------------------------------------
+CREATE FUNCTION render_next_frame(p_verbose boolean DEFAULT false)
+RETURNS int AS $$
+DECLARE fid int;
+BEGIN
+  SELECT frame_id INTO fid
+    FROM frame
+   WHERE png IS NULL
+   ORDER BY frame_id
+     FOR UPDATE SKIP LOCKED
+   LIMIT 1;
+
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  RETURN render_frame(fid, p_verbose);
+END $$ LANGUAGE plpgsql;

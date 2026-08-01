@@ -695,3 +695,31 @@ SELECT ok(raises($$SELECT render_frame('no-such-frame')$$),
           'rendering a frame that does not exist is an error');
 
 DELETE FROM frame WHERE name LIKE 't_frame%';
+
+
+\echo == the frame queue ==
+
+-- The queue is the backlog, so an empty backlog has to be a value the driver
+-- can loop on rather than an error it has to catch.
+SELECT ok(render_next_frame() IS NULL,
+          'the queue hands back nothing when every frame is rendered');
+
+-- Frames come off in frame_id order, and a frame that has its bytes is no
+-- longer in the queue at all -- which is the same clause that makes an
+-- interrupted sequence resumable.
+INSERT INTO frame (name, w, h, aa, maxdepth) VALUES ('t_q1', 24, 16, 1, 2);
+INSERT INTO frame (name, w, h, aa, maxdepth) VALUES ('t_q2', 24, 16, 1, 2);
+
+SELECT ok(render_next_frame()
+          = (SELECT frame_id FROM frame WHERE name = 't_q1'),
+          'the queue takes the oldest unrendered frame first');
+SELECT ok(render_next_frame()
+          = (SELECT frame_id FROM frame WHERE name = 't_q2'),
+          'and then the next one');
+SELECT ok(render_next_frame() IS NULL,
+          'a frame that has been rendered is not offered again');
+
+SELECT ok(count(*) = 2, 'both queued frames came out with their bytes')
+FROM frame WHERE name LIKE 't_q%' AND png IS NOT NULL;
+
+DELETE FROM frame WHERE name LIKE 't_q%';

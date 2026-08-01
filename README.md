@@ -21,7 +21,7 @@ triangle meshes, and the tracer does not know which is which.
 ```bash
 docker compose up -d      # PostgreSQL 17
 ./load.sh                 # install the engine and build the default scene
-./test.sh                 # 97 checks on the encoders, the geometry and the optics
+./test.sh                 # 102 checks on the encoders, the geometry and the optics
 ./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
 
@@ -101,6 +101,21 @@ costs nothing beyond the frames themselves. Resuming an interrupted sequence is
 `WHERE png IS NULL`, which is also why the rows are inserted before anything is
 traced: the sequence is data, and rendering it is a separate step.
 `examples/orbit.sql` is that, end to end, against whatever scene is loaded.
+
+Because the backlog is a table, several sessions can work through it at once:
+
+```bash
+./render_frames.sh 8      # eight sessions against `frame WHERE png IS NULL`
+```
+
+`render_next_frame()` claims one row with `FOR UPDATE SKIP LOCKED`, so sessions
+take disjoint frames with no coordination and no work list anywhere — sessions
+can be added or killed mid-run, and one that dies puts its frame straight back
+in the queue. The orbit above is 24 frames: 144 s one at a time, **37 s at
+eight**, byte-identical either way.
+
+The driver is a shell script because it has to be. Nothing in core PostgreSQL
+starts a background job, and `dblink` and `pg_background` are extensions.
 
 The row stores the PNG rather than the pixels. `img` holds 8-bit values that
 already went through exposure, the tone curve, gamma and clipping, so keeping
@@ -262,8 +277,8 @@ once.
 | `sql/04_scene.sql` | the light table, sky, the default scene |
 | `sql/05_trace.sql` | Fresnel, absorption, direct lighting, ray spawning |
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
-| `sql/07_frame.sql` | the frame table and the render that stores its result |
-| `test/tests.sql` | 97 checks |
+| `sql/07_frame.sql` | the frame table, the render that stores its result, the queue |
+| `test/tests.sql` | 102 checks |
 | `examples/` | a torus OBJ, the scene that loads it, and a camera orbit |
 | [`research/`](research) | the measurements behind the design |
 
