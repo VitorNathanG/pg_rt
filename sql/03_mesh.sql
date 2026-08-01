@@ -345,6 +345,18 @@ CREATE TYPE hit AS (
   back boolean
 );
 
+-- Rebuild a hit from flat columns.  The renderer stores its accumulated hits
+-- as loose float8 because a nested composite pays a tuple header at every
+-- level, but the shading functions want the record, so this is the seam
+-- between the two representations.  Every parameter is named exactly once, so
+-- it inlines whatever the arguments cost.
+CREATE FUNCTION hit_of(t float8, mat int, px float8, py float8, pz float8,
+                       nx float8, ny float8, nz float8, back boolean)
+RETURNS hit
+  AS $$ SELECT ROW(t, mat, ROW(px, py, pz)::vec3,
+                   ROW(nx, ny, nz)::vec3, back)::hit $$
+  LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
 -- Exact distance ties are resolved on tri_id, which is what makes this a
 -- genuine minimum rather than "whichever arrived first".  A combine function
 -- has to be commutative for a parallel aggregate to have a defined answer,

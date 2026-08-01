@@ -66,7 +66,7 @@ intermediates:
 
 | table | rows | size |
 |---|---|---|
-| **`rt_hit`** | **8 649 154** | **≈ 2.29 GB** |
+| **`rt_hit`** | **8 649 154** | **≈ 1.36 GB** (≈ 2.42 GB before it was flattened) |
 | `rt_ray` / `rt_new` (peak) | 2 073 600 | ≈ 0.55 GB each |
 | `rt_rad` | 5 353 903 | ≈ 0.46 GB |
 | `rt_sray` | 2 557 607 | ≈ 0.30 GB |
@@ -84,29 +84,70 @@ hit spawns four children and dispersion outruns absorption for the first bounce.
 Total is 4.17× the primary ray count here, against 4.63× at 240×160 with 2×2
 samples — the ratio is not quite resolution-independent.
 
-### About half of that is tuple header, not data
+### About half of that was tuple header, not data
 
 Measured on probe tables of identical shape:
 
 | | bytes/row | useful payload |
 |---|---|---|
-| `rt_hit` / `rt_new` | 264.5 | 125 |
+| `rt_hit` / `rt_new`, as records | 264.5 (279.5 in place) | 125 |
 | `rt_ray` | 264.8 | 129 |
 | `rt_sray` | 118.0 | 92 |
 | `rt_rad` | 86.5 | 32 |
 
 A standalone `vec3` measures **48 bytes for 24 bytes of floats** — the composite
 tuple header doubles it — and a whole `hit` record is 127 bytes. An `rt_hit` row
-carries three nested composites (`d`, `att`, `h`, the last containing two more),
-so it pays that tax at several levels, then again for the row header and item
+carried three nested composites (`d`, `att`, `h`, the last containing two more),
+so it paid that tax at several levels, then again for the row header and item
 pointer.
 
 This is the same problem `tri` solves with its flat `float8` mirror columns, but
-for a different reason. `tri` is read once per *candidate pair*, millions of
-times per bounce, so `FieldSelect` cost dominated there. `rt_hit` is read once
-per ray, so nobody ever paid to flatten it — the cost shows up as bytes rather
-than as time.
+it reached `rt_hit` much later and for a different reason. `tri` is read once per
+*candidate pair*, millions of times per bounce, so `FieldSelect` cost dominated
+there and forced the issue early. `rt_hit` is read about three times per ray, so
+its cost never showed up on a clock — only on a disk.
 
-It is the practical ceiling on the current design: at 2×2 samples all of this
-quadruples, putting `rt_hit` near 10 GB for a full HD frame. Lifting it is
-straightforward — `rt_hit` never needs `d` and `att` as `vec3` at all.
+### Flattening it: 1.77x on the only table that accumulates
+
+`rt_hit` now stores loose `float8` and rebuilds the records on read through
+`hit_of()` and `v3()`, both of which inline. Measured on the real table at
+240×160, 2×2 samples, depth 5 — 711 087 rows, same rows either way:
+
+| | bytes/row | table |
+|---|---|---|
+| nested records | 279.5 | 190 MB |
+| flat columns | **157.5** | **107 MB** |
+
+**Column order was worth 8.8 bytes of that.** Written in reading order, `mat`
+sits between two `float8` and every row pays four bytes of alignment padding to
+climb back onto an eight-byte boundary — 167.8 bytes/row against 159.0 on
+probes of the two orderings. The narrow columns are therefore grouped ahead of
+the wide ones, which is the one place in the schema where declaration order is
+load-bearing rather than editorial.
+
+**It costs about 1.8% of a frame, and that is the right trade.** Interleaved,
+three reps each, same settings:
+
+| phase | records | flat |
+|---|---|---|
+| shadow rays | 1856 / 1888 / 1821 ms | 1972 / 1791 / 1774 ms |
+| direct lighting | 521 / 537 / 553 ms | 527 / 516 / 532 ms |
+| shading | 1101 / 1138 / 1115 ms | 1208 / 1224 / 1195 ms |
+| whole frame | 13.61 / 13.69 / 13.73 s | 13.97 / 13.83 / 13.97 s |
+
+The whole cost lands in shading, ~8%, and it is exactly what you would expect:
+`shade()` takes a `hit`, so where the record used to be read already-formed off
+the page it is now constructed per row. Reconstruction is not free even when it
+inlines. Everything else is a wash.
+
+Paying 1.8% of a frame to lift the memory ceiling by 1.77× is worth it because
+the ceiling is the binding constraint and the clock is not: at 2×2 samples a
+full HD frame's intermediates all quadruple, and `rt_hit` as records was heading
+for roughly 10 GB — a disk-space failure rather than a slow render. Anything
+that raises the ray count per hit multiplies that table directly, so the cheapest
+time to have done this was before such a feature, not after.
+
+Output is bit-identical on both example scenes, which the flat arithmetic has to
+be written deliberately to preserve: `v3_scale` multiplies by a reciprocal, so
+the shadow-ray direction is `v * (1.0 / dist)` and **not** `v / dist`. Those are
+different in floating point.

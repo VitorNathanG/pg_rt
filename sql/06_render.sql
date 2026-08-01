@@ -108,8 +108,34 @@ BEGIN
   SET LOCAL min_parallel_table_scan_size = 0;
   SET LOCAL parallel_setup_cost = 100;
 
+  -- Flat float8 rather than the vec3 and hit records the shading functions
+  -- take, because this is the one table that accumulates.  Every other scratch
+  -- table here holds a single bounce and is dropped at the top of the next;
+  -- rt_hit keeps every hit at every depth so that shading can run once over
+  -- all of them, which makes its width the practical ceiling on resolution.
+  --
+  -- A nested composite pays a tuple header at every level, so as records this
+  -- row measured 279.5 bytes to carry 125 bytes of floats; flat it is 157.5,
+  -- and a full HD frame at one sample builds 8.6 million of them.
+  --
+  -- The seam is not free.  hit_of() and v3() inline, but a record shade() used
+  -- to read already-formed off the page now gets constructed per row, which
+  -- costs about 8% of the shading phase and 1.8% of a frame.  That buys 1.77x
+  -- on the one table whose size is a ceiling rather than a cost.
+  --
+  -- The narrow columns are grouped ahead of the wide ones rather than kept
+  -- with the fields they belong to.  Left in reading order, `mat` sits between
+  -- two float8 and every row pays four bytes of alignment padding to get back
+  -- onto an eight-byte boundary: 167.8 bytes/row against 159.0 measured.
   CREATE UNLOGGED TABLE rt_hit (
-    hid bigserial, px int, py int, d vec3, att vec3, h hit);
+    hid  bigserial,
+    px   int,    py int,                    -- pixel this ray belongs to
+    mat  int,    back boolean,              -- from the hit record; see below
+    dx   float8, dy float8, dz float8,      -- ray direction
+    ax   float8, ay float8, az float8,      -- attenuation carried to this hit
+    t    float8,                            -- and the rest of the hit record:
+    hx   float8, hy float8, hz float8,      -- point,
+    nx   float8, ny float8, nz float8);     -- and shading normal
 
   -- Every ray set is built with CREATE TABLE AS rather than INSERT INTO.
   -- PostgreSQL refuses to parallelise any statement that writes, and CTAS is
@@ -196,8 +222,15 @@ BEGIN
     ALTER TABLE rt_new SET (parallel_workers = 4);
     ANALYZE rt_new;
 
-    INSERT INTO rt_hit (px, py, d, att, h)
-    SELECT px, py, d, att, h FROM rt_new;
+    -- rt_new keeps its records: it is rebuilt every bounce, and child_ray
+    -- wants them.  Only what accumulates is worth flattening.
+    INSERT INTO rt_hit (px, py, mat, back, dx, dy, dz, ax, ay, az,
+                        t, hx, hy, hz, nx, ny, nz)
+    SELECT px, py, (h).mat, (h).back,
+           (d).x, (d).y, (d).z, (att).x, (att).y, (att).z,
+           (h).t, ((h).p).x, ((h).p).y, ((h).p).z,
+           ((h).n).x, ((h).n).y, ((h).n).z
+    FROM rt_new;
 
     IF p_verbose THEN
       GET DIAGNOSTICS live = ROW_COUNT;
@@ -243,18 +276,26 @@ BEGIN
   ts := clock_timestamp();
   CREATE UNLOGGED TABLE rt_sray AS
   SELECT h.hid, l.light_id,
-         (so.p).x AS ox, (so.p).y AS oy, (so.p).z AS oz,
-         (sl.ld).x AS dx, (sl.ld).y AS dy, (sl.ld).z AS dz,
-         1.0 / nz((sl.ld).x) AS ivx, 1.0 / nz((sl.ld).y) AS ivy,
-         1.0 / nz((sl.ld).z) AS ivz, dd.dist
+         h.hx + h.nx * 1e-3 AS ox,
+         h.hy + h.ny * 1e-3 AS oy,
+         h.hz + h.nz * 1e-3 AS oz,
+         sl.ldx AS dx, sl.ldy AS dy, sl.ldz AS dz,
+         1.0 / nz(sl.ldx) AS ivx, 1.0 / nz(sl.ldy) AS ivy,
+         1.0 / nz(sl.ldz) AS ivz, dd.dist
   FROM rt_hit h
-       JOIN material m ON m.mat_id = (h.h).mat
+       JOIN material m ON m.mat_id = h.mat
        CROSS JOIN light l
-       CROSS JOIN LATERAL (SELECT (h.h).p + (h.h).n * 1e-3 OFFSET 0) AS so(p)
-       CROSS JOIN LATERAL (SELECT l.p - (h.h).p OFFSET 0) AS lv(v)
-       CROSS JOIN LATERAL (SELECT v3_len(lv.v) OFFSET 0) AS dd(dist)
-       CROSS JOIN LATERAL (SELECT lv.v * (1.0 / dd.dist) OFFSET 0) AS sl(ld)
-  WHERE wants_light(h.d, h.h, m, l);
+       CROSS JOIN LATERAL (SELECT (l.p).x - h.hx, (l.p).y - h.hy,
+                                  (l.p).z - h.hz OFFSET 0) AS lv(vx, vy, vz)
+       CROSS JOIN LATERAL (SELECT sqrt(lv.vx * lv.vx + lv.vy * lv.vy
+                                       + lv.vz * lv.vz) OFFSET 0) AS dd(dist)
+       CROSS JOIN LATERAL (SELECT lv.vx * (1.0 / dd.dist),
+                                  lv.vy * (1.0 / dd.dist),
+                                  lv.vz * (1.0 / dd.dist)
+                           OFFSET 0) AS sl(ldx, ldy, ldz)
+  WHERE wants_light(v3(h.dx, h.dy, h.dz),
+                    hit_of(h.t, h.mat, h.hx, h.hy, h.hz,
+                           h.nx, h.ny, h.nz, h.back), m, l);
   ALTER TABLE rt_sray SET (parallel_workers = 4);
   ANALYZE rt_sray;
 
@@ -320,16 +361,19 @@ BEGIN
   SELECT hid, ROW(sum((e).x), sum((e).y), sum((e).z))::vec3 AS rad
   FROM (
     SELECT s.hid,
-           light_rad(h.d, h.h, m, l, coalesce(sh.att, ROW(1,1,1)::vec3)) AS e
+           light_rad(v3(h.dx, h.dy, h.dz),
+                     hit_of(h.t, h.mat, h.hx, h.hy, h.hz,
+                            h.nx, h.ny, h.nz, h.back),
+                     m, l, coalesce(sh.att, ROW(1,1,1)::vec3)) AS e
     FROM rt_sray s
          JOIN rt_hit h    ON h.hid = s.hid
-         JOIN material m  ON m.mat_id = (h.h).mat
+         JOIN material m  ON m.mat_id = h.mat
          JOIN light l     ON l.light_id = s.light_id
          LEFT JOIN rt_shadow sh ON sh.hid = s.hid AND sh.light_id = s.light_id
     UNION ALL
-    SELECT h.hid, sky_sun(h.d, l)
+    SELECT h.hid, sky_sun(v3(h.dx, h.dy, h.dz), l)
     FROM rt_hit h CROSS JOIN light l
-    WHERE (h.h).mat = 0 AND l.sky_k > 0.0
+    WHERE h.mat = 0 AND l.sky_k > 0.0
   ) AS p
   GROUP BY hid;
   CREATE INDEX ON rt_rad (hid);
@@ -355,10 +399,14 @@ BEGIN
            ROW(sum((sh.c).x), sum((sh.c).y), sum((sh.c).z))::vec3
              * (1.0 / (aa * aa)) AS col
     FROM rt_hit h
-         LEFT JOIN material m ON m.mat_id = (h.h).mat
+         LEFT JOIN material m ON m.mat_id = h.mat
          LEFT JOIN rt_rad e   ON e.hid = h.hid
          CROSS JOIN LATERAL (
-           SELECT shade(h.d, h.h, h.att, m, coalesce(e.rad, ROW(0,0,0)::vec3))
+           SELECT shade(v3(h.dx, h.dy, h.dz),
+                        hit_of(h.t, h.mat, h.hx, h.hy, h.hz,
+                               h.nx, h.ny, h.nz, h.back),
+                        v3(h.ax, h.ay, h.az), m,
+                        coalesce(e.rad, ROW(0,0,0)::vec3))
            OFFSET 0) AS sh(c)
     GROUP BY h.px, h.py
   ) AS q;
