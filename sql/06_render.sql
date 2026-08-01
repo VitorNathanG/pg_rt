@@ -92,9 +92,21 @@ BEGIN
   -- A ray also carries its inverse direction as a real column.  Recomputing
   -- it in the query costs far more than storing it: the slab test mentions
   -- it twelve times, and an inlined expression is evaluated at every mention.
+  --
+  -- Origin and direction are carried twice: once as vec3 for the shading and
+  -- spawning code, which is written in vector algebra, and once broken out
+  -- into float8 columns for the two intersection joins.  The duplication is
+  -- 48 bytes a row and it removes a FieldSelect from every one of the ~60
+  -- places the inlined slab and triangle tests name a ray component.  The
+  -- inverse direction has no vector form at all -- nothing but box_hit ever
+  -- reads it.
   CREATE UNLOGGED TABLE rt_ray AS
   SELECT row_number() OVER () AS rid, gx.px, gy.py,
-         cam_from() AS o, cr.dir AS d, v3_inv(cr.dir) AS iv,
+         cam_from() AS o, cr.dir AS d,
+         (cam_from()).x AS ox, (cam_from()).y AS oy, (cam_from()).z AS oz,
+         (cr.dir).x AS dx, (cr.dir).y AS dy, (cr.dir).z AS dz,
+         (v3_inv(cr.dir)).x AS ivx, (v3_inv(cr.dir)).y AS ivy,
+         (v3_inv(cr.dir)).z AS ivz,
          ROW(1,1,1)::vec3 AS att, 0 AS chan
   FROM generate_series(0, img_w - 1) AS gx(px),
        generate_series(0, img_h - 1) AS gy(py),
@@ -118,12 +130,18 @@ BEGIN
     WITH best AS (
       SELECT r.rid, nearest(ROW(x.t, t.tri_id)::cand) AS c
       FROM rt_ray r
-           JOIN mesh_box mb ON box_hit(r.o, r.iv, mb.lo, mb.hi)
+           JOIN mesh_box mb ON box_hit(r.ox, r.oy, r.oz, r.ivx, r.ivy, r.ivz,
+                                       mb.lox, mb.loy, mb.loz,
+                                       mb.hix, mb.hiy, mb.hiz)
            JOIN bvh_node n  ON n.mesh_id = mb.mesh_id
-                           AND box_hit(r.o, r.iv, n.lo, n.hi)
+                           AND box_hit(r.ox, r.oy, r.oz, r.ivx, r.ivy, r.ivz,
+                                       n.lox, n.loy, n.loz, n.hix, n.hiy, n.hiz)
            JOIN tri t       ON t.cl = n.cl
            CROSS JOIN LATERAL (
-             SELECT tri_hit(r.o, r.d, t.a, t.b, t.c) OFFSET 0) AS x(t)
+             SELECT tri_hit(r.ox, r.oy, r.oz, r.dx, r.dy, r.dz,
+                            t.ax, t.ay, t.az, t.e1x, t.e1y, t.e1z,
+                            t.e2x, t.e2y, t.e2z, t.gnx, t.gny, t.gnz)
+             OFFSET 0) AS x(t)
       WHERE x.t IS NOT NULL
       GROUP BY r.rid
     )
@@ -154,7 +172,11 @@ BEGIN
     DROP TABLE rt_ray;
     CREATE UNLOGGED TABLE rt_ray AS
     SELECT row_number() OVER () AS rid, s.px, s.py, s.o, s.d,
-           v3_inv(s.d) AS iv, s.att, s.chan
+           (s.o).x AS ox, (s.o).y AS oy, (s.o).z AS oz,
+           (s.d).x AS dx, (s.d).y AS dy, (s.d).z AS dz,
+           1.0 / nz((s.d).x) AS ivx, 1.0 / nz((s.d).y) AS ivy,
+           1.0 / nz((s.d).z) AS ivz,
+           s.att, s.chan
     FROM (
       SELECT h.px, h.py, (c.r).o AS o, (c.r).d AS d,
              (c.r).att AS att, (c.r).chan AS chan
@@ -178,10 +200,14 @@ BEGIN
   -- actually show get one.
   ts := clock_timestamp();
   CREATE UNLOGGED TABLE rt_sray AS
-  SELECT h.hid, (h.h).p + (h.h).n * 1e-3 AS o, sl.ld AS d,
-         v3_inv(sl.ld) AS iv, dd.dist
+  SELECT h.hid,
+         (so.p).x AS ox, (so.p).y AS oy, (so.p).z AS oz,
+         (sl.ld).x AS dx, (sl.ld).y AS dy, (sl.ld).z AS dz,
+         1.0 / nz((sl.ld).x) AS ivx, 1.0 / nz((sl.ld).y) AS ivy,
+         1.0 / nz((sl.ld).z) AS ivz, dd.dist
   FROM rt_hit h
        JOIN material m ON m.mat_id = (h.h).mat
+       CROSS JOIN LATERAL (SELECT (h.h).p + (h.h).n * 1e-3 OFFSET 0) AS so(p)
        CROSS JOIN LATERAL (SELECT light_p() - (h.h).p OFFSET 0) AS lv(v)
        CROSS JOIN LATERAL (SELECT v3_len(lv.v) OFFSET 0) AS dd(dist)
        CROSS JOIN LATERAL (SELECT lv.v * (1.0 / dd.dist) OFFSET 0) AS sl(ld)
@@ -199,14 +225,20 @@ BEGIN
     SELECT s.hid, n.mesh_id, mm.kind, mm.absorb,
            min(x.t) AS t0, max(x.t) AS t1
     FROM rt_sray s
-         JOIN mesh_box mb ON box_hit(s.o, s.iv, mb.lo, mb.hi)
+         JOIN mesh_box mb ON box_hit(s.ox, s.oy, s.oz, s.ivx, s.ivy, s.ivz,
+                                     mb.lox, mb.loy, mb.loz,
+                                     mb.hix, mb.hiy, mb.hiz)
          JOIN bvh_node n  ON n.mesh_id = mb.mesh_id
-                         AND box_hit(s.o, s.iv, n.lo, n.hi)
+                         AND box_hit(s.ox, s.oy, s.oz, s.ivx, s.ivy, s.ivz,
+                                     n.lox, n.loy, n.loz, n.hix, n.hiy, n.hiz)
          JOIN tri t       ON t.cl = n.cl
          JOIN mesh ms     ON ms.mesh_id = n.mesh_id
          JOIN material mm ON mm.mat_id = ms.mat_id
          CROSS JOIN LATERAL (
-           SELECT tri_hit(s.o, s.d, t.a, t.b, t.c) OFFSET 0) AS x(t)
+           SELECT tri_hit(s.ox, s.oy, s.oz, s.dx, s.dy, s.dz,
+                          t.ax, t.ay, t.az, t.e1x, t.e1y, t.e1z,
+                          t.e2x, t.e2y, t.e2z, t.gnx, t.gny, t.gnz)
+           OFFSET 0) AS x(t)
     WHERE x.t IS NOT NULL AND x.t < s.dist
     GROUP BY s.hid, n.mesh_id, mm.kind, mm.absorb
   )

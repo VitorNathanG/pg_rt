@@ -89,6 +89,7 @@ DECLARE
   ld   vec3;
   dist float8;
   ndl  float8;
+  cs   float8;
   spec float8;
 BEGIN
   -- Miss: the ray escapes and picks up the sky it was pointing at.
@@ -111,7 +112,13 @@ BEGIN
 
   -- Metal and glass contribute only a specular highlight locally; their
   -- appearance comes from the reflected and refracted children.
-  spec := pow_safe(greatest(v3_dot((h).n, v3_unit(ld - d)), 0.0), m.spec_e);
+  --
+  -- The half-vector cosine goes through a local for the reason spelled out on
+  -- make_hit: pow_safe names its base three times, so handing it twenty
+  -- operators' worth of arithmetic stops it inlining and turns a handful of
+  -- flops into a per-call executor run.
+  cs   := greatest(v3_dot((h).n, v3_unit(ld - d)), 0.0);
+  spec := pow_safe(cs, m.spec_e);
   IF spec < 1e-4 THEN RETURN ROW(0, 0, 0)::vec3; END IF;
   RETURN att * light_col() * (spec * m.spec_k) * sh;
 END $$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
@@ -121,12 +128,13 @@ END $$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
 -- tight, so this rejects most of the frame's non-diffuse hits before they
 -- cost an intersection.
 CREATE FUNCTION wants_light(d vec3, h hit, m material) RETURNS boolean AS $$
-DECLARE ld vec3;
+DECLARE ld vec3; cs float8;
 BEGIN
   IF (h).mat = 0 THEN RETURN false; END IF;
   ld := v3_unit(light_p() - (h).p);
   IF m.kind = mat_diffuse() THEN RETURN v3_dot((h).n, ld) > 0.0; END IF;
-  RETURN pow_safe(greatest(v3_dot((h).n, v3_unit(ld - d)), 0.0), m.spec_e) >= 1e-4;
+  cs := greatest(v3_dot((h).n, v3_unit(ld - d)), 0.0);
+  RETURN pow_safe(cs, m.spec_e) >= 1e-4;
 END $$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
 
 -- ---------------------------------------------------------------------------

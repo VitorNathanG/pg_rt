@@ -77,6 +77,26 @@ CREATE FUNCTION v3_len(a vec3) RETURNS float8
 -- folding this into the caller's expression tree and paying a full function
 -- invocation per vector.  The cost is recomputing the length three times;
 -- that is far cheaper than the call it avoids.
+--
+-- FROM-less is necessary but NOT sufficient, and this function is where that
+-- bites hardest.  `inline_function` also refuses when a parameter the body
+-- names more than once is handed an expression costing more than ten
+-- operators -- otherwise inlining would multiply that expression by the usage
+-- count.  v3_unit names its argument twelve times, so ANY caller passing more
+-- than ten operations' worth of arithmetic silently gets a real SQL function
+-- call: a whole executor run, about 3.5 us, per vector.  `v3_unit(v3_cross(b
+-- - a, c - a))` was doing exactly that, once per ray.
+--
+-- Two escapes, both used below.  A PL/pgSQL caller can assign the argument to
+-- a local first, which makes it a Param and costs nothing to duplicate.  A
+-- SQL caller can use the component form: three separate parameters means the
+-- threshold applies per component, so ten operators buys three times as much.
+CREATE FUNCTION v3_unit(x float8, y float8, z float8) RETURNS vec3
+  AS $$ SELECT ROW(x / nullif(sqrt(x * x + y * y + z * z), 0),
+                   y / nullif(sqrt(x * x + y * y + z * z), 0),
+                   z / nullif(sqrt(x * x + y * y + z * z), 0))::vec3 $$
+  LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
 CREATE FUNCTION v3_unit(a vec3) RETURNS vec3
   AS $$ SELECT ROW(a.x / nullif(sqrt(a.x * a.x + a.y * a.y + a.z * a.z), 0),
                    a.y / nullif(sqrt(a.x * a.x + a.y * a.y + a.z * a.z), 0),
