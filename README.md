@@ -21,7 +21,7 @@ triangle meshes, and the tracer does not know which is which.
 ```bash
 docker compose up -d      # PostgreSQL 17
 ./load.sh                 # install the engine and build the default scene
-./test.sh                 # 88 checks on the encoders, the geometry and the optics
+./test.sh                 # 97 checks on the encoders, the geometry and the optics
 ./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
 
@@ -68,6 +68,43 @@ INSERT INTO light (name, p, col, pow) VALUES
 background as well as on the surfaces it lights. Keeping that on the light
 rather than in the sky is what holds the two consistent: move the light and its
 reflection moves with it.
+
+## Renders are rows too
+
+`render()` fills `img`, a scratch table that the next render replaces. A
+`frame` row is the durable version: the settings, the camera, and the encoded
+PNG together, so the database records what a picture is *of* rather than only
+what it looks like.
+
+```sql
+INSERT INTO frame (name, w, h, aa, maxdepth) VALUES ('hero', 600, 400, 2, 5);
+SELECT render_frame('hero');
+SELECT name, w, h, elapsed_ms, length(png) FROM frame;
+```
+
+The camera lives on the frame rather than on the scene, because a camera is a
+property of a *view* of a scene — so a hundred viewpoints are a hundred rows
+against one set of geometry, and a camera path is a query:
+
+```sql
+INSERT INTO frame (name, w, h, cam_from)
+SELECT format('orbit-%s', i), 480, 320,
+       v3(6.7 * cos(radians(i * 6)), 2.35, 6.7 * sin(radians(i * 6)))
+FROM generate_series(0, 59) i;
+
+SELECT render_frame(frame_id) FROM frame WHERE png IS NULL ORDER BY frame_id;
+```
+
+Moving the camera touches no geometry at all — `tri` and the BVH are untouched
+between frames and nothing is reindexed — so this is the one animation that
+costs nothing beyond the frames themselves. Resuming an interrupted sequence is
+`WHERE png IS NULL`.
+
+The row stores the PNG rather than the pixels. `img` holds 8-bit values that
+already went through exposure, the tone curve, gamma and clipping, so keeping
+them would not be a cheaper route back to a differently exposed image than
+re-tracing is — only a much larger one: roughly 100 MB of rows against 6.2 MB
+of `bytea` for a full HD frame.
 
 `examples/torus_scene.sql` builds a scene from `examples/torus.obj` — two
 copies of one OBJ at different sizes and angles, wearing different materials:
@@ -218,7 +255,8 @@ statement, and CTAS is the one exception), and `docker-compose.yml` raises
 | `sql/04_scene.sql` | the light table, sky, the default scene |
 | `sql/05_trace.sql` | Fresnel, absorption, direct lighting, ray spawning |
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
-| `test/tests.sql` | 88 checks |
+| `sql/07_frame.sql` | the frame table and the render that stores its result |
+| `test/tests.sql` | 97 checks |
 | `examples/` | a torus OBJ and the scene that loads it |
 | [`research/`](research) | the measurements behind the design |
 

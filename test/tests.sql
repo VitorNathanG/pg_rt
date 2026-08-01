@@ -655,3 +655,43 @@ SELECT ok((SELECT count(*) FROM img WHERE r = g AND g = b AND r > 150)
         > (SELECT count(*) FROM cam_narrow WHERE r = g AND g = b AND r > 150),
           'a wider field of view puts more sky in the frame');
 
+
+\echo == frames ==
+
+-- The camera is a property of the view, so a degenerate one is refused where
+-- it is written down rather than diagnosed later as a divide by zero.
+SELECT ok(raises($$INSERT INTO frame (name, w, h, cam_from, cam_at)
+                   VALUES ('degenerate', 8, 8, v3(1,1,1), v3(1,1,1))$$),
+          'a frame whose camera sits on its own target is refused');
+SELECT ok(raises($$INSERT INTO frame (name, w, h, cam_fov) VALUES ('wide', 8, 8, 200.0)$$),
+          'a frame with a field of view past a half turn is refused');
+
+-- A frame row is the description and the result together.
+INSERT INTO frame (name, w, h, aa, maxdepth) VALUES ('t_frame', 48, 32, 1, 3);
+SELECT render_frame('t_frame');
+SELECT ok(substring(png from 1 for 8) = '\x89504e470d0a1a0a'::bytea
+      AND length(png) > 100
+      AND rendered_at IS NOT NULL
+      AND elapsed_ms >= 0,
+          'render_frame stores a PNG and its provenance on the row')
+FROM frame WHERE name = 't_frame';
+
+-- The kept PNG must be the same bytes the direct path produces, or the archive
+-- is quietly a different picture from the one the renderer was asked for.
+SELECT ok((SELECT png FROM frame WHERE name = 't_frame')
+          = render_png(48, 32, 1, 3, 1.35),
+          'a stored frame is byte-identical to rendering it directly');
+
+-- Two frames differing only in camera must differ only as the camera does,
+-- which is the whole basis of a camera move being a row rather than a feature.
+INSERT INTO frame (name, w, h, aa, maxdepth, cam_from)
+VALUES ('t_frame2', 48, 32, 1, 3, v3(-0.55, 2.35, -6.70));
+SELECT render_frame('t_frame2');
+SELECT ok((SELECT png FROM frame WHERE name = 't_frame')
+       <> (SELECT png FROM frame WHERE name = 't_frame2'),
+          'a frame rendered from the far side is a different picture');
+
+SELECT ok(raises($$SELECT render_frame('no-such-frame')$$),
+          'rendering a frame that does not exist is an error');
+
+DELETE FROM frame WHERE name LIKE 't_frame%';
