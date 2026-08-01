@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:17
+    container_name: pg_rt
+    environment:
+      POSTGRES_USER: rt
+      POSTGRES_PASSWORD: rt
+      POSTGRES_DB: rt
+    ports:
+      - "5433:5432"
+    command:
+      - postgres
+      # A raytracer is one big recursive CTE; give the executor room to work.
+      - -c
+      - work_mem=512MB
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - max_parallel_workers_per_gather=4
+      - -c
+      - jit=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rt -d rt"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
