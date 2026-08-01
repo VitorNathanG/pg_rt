@@ -73,68 +73,100 @@ CREATE FUNCTION beer(h hit, m material) RETURNS vec3 AS $$
          END $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- ---------------------------------------------------------------------------
+-- Direct lighting.
+--
+-- The work splits at the (hit, light) pair.  light_rad computes what one light
+-- delivers to one hit; shade computes how the surface answers, and answers the
+-- sum of the lights rather than one of them.  That split is the whole of
+-- multi-light support: everything depending only on the surface -- the albedo,
+-- the checker lookup, the Fresnel weight, the specular strength -- is computed
+-- once per hit no matter how many lights the scene holds, and the renderer
+-- resolves the pairs as one join instead of a loop.
+-- ---------------------------------------------------------------------------
+
+-- What one light delivers to one hit, already attenuated by `sh`, the shadow
+-- transmission along the ray to that light.  Both `sh` and the summation are
+-- the renderer's job, for the same reason: every shadow ray in the frame is
+-- intersected in one pass, and every light is summed in one aggregate.
+--
+-- The two branches return different quantities on purpose.  A diffuse surface
+-- wants irradiance; a specular one wants the value of its lobe toward the
+-- light.  Each is exactly the factor that depends on which light this is, and
+-- each hit takes exactly one branch, so shade knows which response to apply
+-- from the material it already has in hand.
+--
+-- The half-vector cosine goes through a local for the reason spelled out on
+-- make_hit: pow_safe names its base three times, so handing it twenty
+-- operators' worth of arithmetic stops it inlining and turns a handful of
+-- flops into a per-call executor run.
+CREATE FUNCTION light_rad(d vec3, h hit, m material, l light, sh vec3)
+RETURNS vec3 AS $$
+DECLARE
+  lv   vec3   := l.p - (h).p;
+  dist float8 := v3_len(lv);
+  ld   vec3   := lv * (1.0 / dist);
+  cs   float8;
+BEGIN
+  IF m.kind = mat_diffuse() THEN
+    RETURN l.col * (l.pow / (dist * dist) * greatest(v3_dot((h).n, ld), 0.0))
+         * sh;
+  END IF;
+  cs := greatest(v3_dot((h).n, v3_unit(ld - d)), 0.0);
+  RETURN l.col * pow_safe(cs, m.spec_e) * sh;
+END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
+
+-- A (hit, light) pair is worth a shadow ray only where that light can actually
+-- show: on a diffuse surface facing it, or inside a specular lobe aimed at it.
+-- The lobes are tight, so this rejects most of the frame's non-diffuse hits
+-- before they cost an intersection -- and it decides per light, so a rim light
+-- behind the subject pays only for the hits it can reach.
+--
+-- The same predicate also decides which pairs contribute at all: below these
+-- thresholds light_rad's answer rounds away, so the renderer sums only what
+-- survives here.
+CREATE FUNCTION wants_light(d vec3, h hit, m material, l light) RETURNS boolean AS $$
+DECLARE ld vec3; cs float8;
+BEGIN
+  IF (h).mat = 0 THEN RETURN false; END IF;
+  ld := v3_unit(l.p - (h).p);
+  IF m.kind = mat_diffuse() THEN RETURN v3_dot((h).n, ld) > 0.0; END IF;
+  cs := greatest(v3_dot((h).n, v3_unit(ld - d)), 0.0);
+  RETURN pow_safe(cs, m.spec_e) >= 1e-4;
+END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
+
+-- ---------------------------------------------------------------------------
 -- shade: the radiance a hit contributes directly, already weighted by the
 -- throughput `att` the ray carried to get here.  Energy that continues via
 -- reflection or refraction is NOT counted here -- the child rows carry it,
 -- and the sum over all rows of a pixel adds the two together.
 --
--- `sh` is the shadow transmission toward the key light, computed set-based by
--- the renderer.  Passing it in rather than tracing it here is what lets every
--- shadow ray in the frame be intersected in one pass.
+-- `e` is everything the lights delivered to this hit, summed by the renderer
+-- over the pairs that survived wants_light and shadowing.  A hit no light
+-- reaches gets a zero vector, which is also the right answer for a scene with
+-- no lights in it.
 -- ---------------------------------------------------------------------------
 
-CREATE FUNCTION shade(d vec3, h hit, att vec3, m material, sh vec3) RETURNS vec3 AS $$
-DECLARE
-  lv   vec3;
-  ld   vec3;
-  dist float8;
-  ndl  float8;
-  cs   float8;
-  spec float8;
+CREATE FUNCTION shade(d vec3, h hit, att vec3, m material, e vec3) RETURNS vec3 AS $$
 BEGIN
-  -- Miss: the ray escapes and picks up the sky it was pointing at.
-  IF (h).mat = 0 THEN RETURN att * sky(d); END IF;
-
-  lv   := light_p() - (h).p;
-  dist := v3_len(lv);
-  ld   := lv * (1.0 / dist);
+  -- Miss: the ray escapes and picks up the sky it was pointing at.  The light
+  -- discs painted on that sky are in `e` as well -- looking at a light is the
+  -- one way a miss is lit.
+  IF (h).mat = 0 THEN RETURN att * (sky_bg(d) + e); END IF;
 
   IF m.kind = mat_diffuse() THEN
-    -- Lambertian diffuse under the key light plus a sky fill term.  The
-    -- (1 - kr) factor is the energy *not* handed to the reflection child.
-    ndl := greatest(v3_dot((h).n, ld), 0.0);
+    -- Lambertian diffuse under the lights plus a sky fill term.  The (1 - kr)
+    -- factor is the energy *not* handed to the reflection child.
     RETURN att * mat_albedo(m, (h).p)
-               * (light_col() * (light_pow() / (dist * dist) * ndl) * sh
-                  + sky_bg((h).n) * 0.09)
+               * (e + sky_bg((h).n) * 0.09)
                * (1.0 - least(m.kr_max,
                               fresnel_schlick(-v3_dot(d, (h).n), m.f0)));
   END IF;
 
   -- Metal and glass contribute only a specular highlight locally; their
-  -- appearance comes from the reflected and refracted children.
-  --
-  -- The half-vector cosine goes through a local for the reason spelled out on
-  -- make_hit: pow_safe names its base three times, so handing it twenty
-  -- operators' worth of arithmetic stops it inlining and turns a handful of
-  -- flops into a per-call executor run.
-  cs   := greatest(v3_dot((h).n, v3_unit(ld - d)), 0.0);
-  spec := pow_safe(cs, m.spec_e);
-  IF spec < 1e-4 THEN RETURN ROW(0, 0, 0)::vec3; END IF;
-  RETURN att * light_col() * (spec * m.spec_k) * sh;
-END $$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
-
--- A hit is worth a shadow ray only where the light can actually show: on a
--- diffuse surface facing the light, or inside a specular lobe.  The lobes are
--- tight, so this rejects most of the frame's non-diffuse hits before they
--- cost an intersection.
-CREATE FUNCTION wants_light(d vec3, h hit, m material) RETURNS boolean AS $$
-DECLARE ld vec3; cs float8;
-BEGIN
-  IF (h).mat = 0 THEN RETURN false; END IF;
-  ld := v3_unit(light_p() - (h).p);
-  IF m.kind = mat_diffuse() THEN RETURN v3_dot((h).n, ld) > 0.0; END IF;
-  cs := greatest(v3_dot((h).n, v3_unit(ld - d)), 0.0);
-  RETURN pow_safe(cs, m.spec_e) >= 1e-4;
+  -- appearance comes from the reflected and refracted children.  `e` already
+  -- holds each light's lobe value, so all that is left is the surface's own
+  -- specular strength.
+  RETURN att * e * m.spec_k;
 END $$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
 
 -- ---------------------------------------------------------------------------

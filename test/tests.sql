@@ -35,6 +35,8 @@ CREATE OR REPLACE FUNCTION m_metal() RETURNS material
   AS $$ SELECT * FROM material WHERE name = 'chrome' $$ LANGUAGE sql STABLE;
 CREATE OR REPLACE FUNCTION m_floor() RETURNS material
   AS $$ SELECT * FROM material WHERE name = 'checker-tile' $$ LANGUAGE sql STABLE;
+CREATE OR REPLACE FUNCTION l_key() RETURNS light
+  AS $$ SELECT * FROM light WHERE name = 'key' $$ LANGUAGE sql STABLE;
 
 -- A hit on the glass block and one on the metal ball, straight down onto the
 -- top of each, so the transport checks have real geometry underneath them.
@@ -429,15 +431,75 @@ SELECT ok(NOT ((child_ray(v3(0,-1,0), h_glass(), v3(1,1,1), 0, 1, m_glass())).d
 -- Shadow rays are only worth firing where the light could show at all.
 SELECT ok(wants_light(v3(0,-1,0),
                       ROW(1.0, (m_floor()).mat_id, v3(-6,0,4), v3(0,1,0), false)::hit,
-                      m_floor()),
+                      m_floor(), l_key()),
           'open floor facing the light wants a shadow ray');
 SELECT ok(NOT wants_light(v3(0,-1,0),
                           ROW(1.0, (m_floor()).mat_id, v3(-6,0,4), v3(0,-1,0), false)::hit,
-                          m_floor()),
+                          m_floor(), l_key()),
           'a surface facing away from the light does not');
 SELECT ok(NOT wants_light(v3(0,-1,0), ROW(0.0, 0, v3(0,0,0), v3(0,1,0), false)::hit,
-                          NULL::material),
+                          NULL::material, l_key()),
           'a ray that escaped to the sky wants nothing');
+
+-- A light behind a surface is rejected for that surface alone: the same hit
+-- can want one light and not another, which is what makes lights independent.
+SELECT ok(wants_light(v3(0,-1,0), h, m_floor(), l_key())
+          AND NOT wants_light(v3(0,-1,0), h, m_floor(), l_under),
+          'the same hit wants the light above it and not the one below')
+FROM (SELECT ROW(1.0, (m_floor()).mat_id, v3(-6,0,4), v3(0,1,0), false)::hit) AS q(h),
+     LATERAL (SELECT ROW(0, 'below', v3(-6,-8,4), v3(1,1,1), 125.0, 0.0, 420.0,
+                         v3_unit(v3(-6,-8,4)))::light) AS u(l_under);
+
+\echo
+\echo == lights ==
+
+-- Falloff is inverse square, so doubling the distance quarters the irradiance.
+-- Checked as a ratio because it holds whatever the light's power happens to be.
+SELECT ok(near((v3_maxc(light_rad(v3(0,-1,0), far, m_floor(), l_key(), v3(1,1,1)))
+                / v3_maxc(light_rad(v3(0,-1,0), near_h, m_floor(), l_key(), v3(1,1,1)))),
+               0.25, 1e-9),
+          'irradiance falls off as one over distance squared')
+FROM (SELECT ROW(1.0, (m_floor()).mat_id, (l_key()).p - v3(0,2,0), v3(0,1,0), false)::hit,
+             ROW(1.0, (m_floor()).mat_id, (l_key()).p - v3(0,1,0), v3(0,1,0), false)::hit)
+     AS q(far, near_h);
+
+-- Shadow transmission scales what a light delivers, and blocks it entirely at
+-- zero -- which is what a shadow is.
+SELECT ok(v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_key(), v3(0,0,0))) = 0.0
+          AND near(v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_key(), v3(0.5,0.5,0.5)))
+                   * 2.0,
+                   v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_key(), v3(1,1,1)))),
+          'shadow transmission scales the light linearly and blocks it at zero')
+FROM (SELECT ROW(1.0, (m_floor()).mat_id, v3(-6,0,4), v3(0,1,0), false)::hit) AS q(h);
+
+-- Radiance is linear in the light's power.  That is what makes an area light
+-- -- several rows sampling one emitter -- add up to the emitter it samples,
+-- and it is the property the renderer leans on when it sums pairs.
+SELECT ok(near(v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_half, v3(1,1,1))) * 2.0,
+               v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_key(), v3(1,1,1)))),
+          'diffuse radiance is linear in the light power')
+FROM (SELECT ROW(1.0, (m_floor()).mat_id, v3(-6,0,4), v3(0,1,0), false)::hit) AS q(h),
+     LATERAL (SELECT ROW((l_key()).light_id, 'half', (l_key()).p, (l_key()).col,
+                         (l_key()).pow / 2.0, 0.0, 420.0,
+                         (l_key()).sky_dir)::light) AS u(l_half);
+
+-- The sky disc must sit where the light does, because that is the whole reason
+-- it is a column of the light rather than a constant of the sky.
+SELECT ok(v3_maxc(sky(v3_unit((l_key()).p))) > v3_maxc(sky(-v3_unit((l_key()).p))),
+          'the sky is brightest looking straight at the light');
+SELECT ok(near(v3_maxc(sky(v3_unit((l_key()).p)) - sky_bg(v3_unit((l_key()).p))),
+               v3_maxc(sky_sun(v3_unit((l_key()).p), l_key()))),
+          'the sky is its background plus the light discs');
+
+-- The stored direction is derived, so it cannot drift from the position.
+SELECT ok(bool_and(sky_dir = v3_unit(p) AND near(v3_len(sky_dir), 1.0)),
+          'every light carries a unit direction matching its position')
+FROM light;
+
+-- A light at the origin has no direction, so it is refused rather than
+-- silently producing a NULL that would poison the radiance sum.
+SELECT ok(raises($$INSERT INTO light (name, p) VALUES ('nowhere', ROW(0,0,0)::vec3)$$),
+          'a light at the world origin is refused');
 
 \echo
 \echo == end to end ==
@@ -450,3 +512,26 @@ SELECT ok(count(DISTINCT (r,g,b)) > 8, 'the render is not a flat fill') FROM img
 SELECT ok(length(png_encode(24, 16, png_scanlines('img'))) = 8 + 25 + 12 + 12
                                                              + length(zlib_stored(png_scanlines('img'))),
           'PNG length is signature + IHDR + IDAT + IEND');
+
+-- The two halves of "lights are rows": a second light must travel the whole
+-- pipeline -- its own shadow ray per lit hit, its own row in every pair join,
+-- its own term in every sum -- and it must change the picture by exactly what
+-- it emits.  A light emitting nothing is the sharper of the two checks: it
+-- drags all of that machinery through the renderer and must still be invisible.
+DROP TABLE IF EXISTS one_light;
+CREATE TEMP TABLE one_light AS SELECT * FROM img;
+
+INSERT INTO light (name, p, col, pow)
+VALUES ('dark', ROW(-4.0, 6.0, 5.0)::vec3, ROW(0, 0, 0)::vec3, 90.0);
+SELECT render(24, 16, 1, 3);
+SELECT ok(count(*) = 0, 'a light that emits nothing changes no pixel')
+FROM img i JOIN one_light o USING (x, y)
+WHERE (i.r, i.g, i.b) IS DISTINCT FROM (o.r, o.g, o.b);
+DELETE FROM light WHERE name = 'dark';
+
+INSERT INTO light (name, p, col, pow)
+VALUES ('fill', ROW(-5.0, 3.0, 4.0)::vec3, ROW(0.25, 0.40, 1.00)::vec3, 140.0);
+SELECT render(24, 16, 1, 3);
+SELECT ok(count(*) > 20, 'a blue fill light lifts the blue channel of the frame')
+FROM img i JOIN one_light o USING (x, y) WHERE i.b > o.b;
+DELETE FROM light WHERE name = 'fill';

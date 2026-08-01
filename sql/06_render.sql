@@ -71,6 +71,7 @@ BEGIN
   DROP TABLE IF EXISTS rt_hit;
   DROP TABLE IF EXISTS rt_sray;
   DROP TABLE IF EXISTS rt_shadow;
+  DROP TABLE IF EXISTS rt_rad;
 
   -- The planner decides how many workers to give a scan from how many PAGES
   -- it holds, which is exactly the wrong measure here: a ray table is small
@@ -199,22 +200,25 @@ BEGIN
     ANALYZE rt_ray;
   END LOOP;
 
-  -- Shadow rays, also in one pass.  Only hits where the key light could
-  -- actually show get one.
+  -- Shadow rays, also in one pass -- one per (hit, light) pair that the light
+  -- in question could actually show on.  The pair, not the hit, is the unit of
+  -- work from here down: a scene with three lights fires three shadow rays at
+  -- an open floor and none at all at a wall facing away from all three.
   ts := clock_timestamp();
   CREATE UNLOGGED TABLE rt_sray AS
-  SELECT h.hid,
+  SELECT h.hid, l.light_id,
          (so.p).x AS ox, (so.p).y AS oy, (so.p).z AS oz,
          (sl.ld).x AS dx, (sl.ld).y AS dy, (sl.ld).z AS dz,
          1.0 / nz((sl.ld).x) AS ivx, 1.0 / nz((sl.ld).y) AS ivy,
          1.0 / nz((sl.ld).z) AS ivz, dd.dist
   FROM rt_hit h
        JOIN material m ON m.mat_id = (h.h).mat
+       CROSS JOIN light l
        CROSS JOIN LATERAL (SELECT (h.h).p + (h.h).n * 1e-3 OFFSET 0) AS so(p)
-       CROSS JOIN LATERAL (SELECT light_p() - (h.h).p OFFSET 0) AS lv(v)
+       CROSS JOIN LATERAL (SELECT l.p - (h.h).p OFFSET 0) AS lv(v)
        CROSS JOIN LATERAL (SELECT v3_len(lv.v) OFFSET 0) AS dd(dist)
        CROSS JOIN LATERAL (SELECT lv.v * (1.0 / dd.dist) OFFSET 0) AS sl(ld)
-  WHERE wants_light(h.d, h.h, m);
+  WHERE wants_light(h.d, h.h, m, l);
   ALTER TABLE rt_sray SET (parallel_workers = 4);
   ANALYZE rt_sray;
 
@@ -225,7 +229,7 @@ BEGIN
   -- keeps glass from casting the flat black hole a binary test would give it.
   CREATE UNLOGGED TABLE rt_shadow AS
   WITH blocker AS (
-    SELECT s.hid, n.mesh_id, mm.kind, mm.absorb,
+    SELECT s.hid, s.light_id, n.mesh_id, mm.kind, mm.absorb,
            min(x.t) AS t0, max(x.t) AS t1
     FROM rt_sray s
          JOIN mesh_box mb ON box_hit(s.ox, s.oy, s.oz, s.ivx, s.ivy, s.ivz,
@@ -245,21 +249,53 @@ BEGIN
                           t.e2x, t.e2y, t.e2z, t.gnx, t.gny, t.gnz)
            OFFSET 0) AS x(t)
     WHERE x.t IS NOT NULL AND x.t < s.dist
-    GROUP BY s.hid, n.mesh_id, mm.kind, mm.absorb
+    GROUP BY s.hid, s.light_id, n.mesh_id, mm.kind, mm.absorb
   )
-  SELECT hid,
+  SELECT hid, light_id,
          CASE WHEN bool_or(kind <> mat_glass()) THEN ROW(0, 0, 0)::vec3
               ELSE ROW(exp(-sum((absorb).x * (t1 - t0))),
                        exp(-sum((absorb).y * (t1 - t0))),
                        exp(-sum((absorb).z * (t1 - t0))))::vec3 * 0.82
          END AS att
-  FROM blocker GROUP BY hid;
+  FROM blocker GROUP BY hid, light_id;
 
-  CREATE INDEX ON rt_shadow (hid);
+  CREATE INDEX ON rt_shadow (hid, light_id);
   ANALYZE rt_shadow;
 
   IF p_verbose THEN
     RAISE NOTICE 'shadows  : % rays in % ms', (SELECT count(*) FROM rt_sray),
+      round(extract(epoch FROM clock_timestamp() - ts)::numeric * 1000);
+    ts := clock_timestamp();
+  END IF;
+
+  -- Collapse the (hit, light) pairs back to one radiance per hit.  This is
+  -- where the light count disappears: everything below sees a single vector
+  -- per hit and cannot tell three lights from one.
+  --
+  -- The second branch is the escaping rays, which are lit only by looking at a
+  -- light -- no shadow ray, since nothing stands between a ray and the sky.
+  -- Both branches key on hid, so the two grains reduce in one aggregate.
+  CREATE UNLOGGED TABLE rt_rad AS
+  SELECT hid, sum(e) AS rad
+  FROM (
+    SELECT s.hid,
+           light_rad(h.d, h.h, m, l, coalesce(sh.att, ROW(1,1,1)::vec3)) AS e
+    FROM rt_sray s
+         JOIN rt_hit h    ON h.hid = s.hid
+         JOIN material m  ON m.mat_id = (h.h).mat
+         JOIN light l     ON l.light_id = s.light_id
+         LEFT JOIN rt_shadow sh ON sh.hid = s.hid AND sh.light_id = s.light_id
+    UNION ALL
+    SELECT h.hid, sky_sun(h.d, l)
+    FROM rt_hit h CROSS JOIN light l
+    WHERE (h.h).mat = 0 AND l.sky_k > 0.0
+  ) AS p
+  GROUP BY hid;
+  CREATE INDEX ON rt_rad (hid);
+  ANALYZE rt_rad;
+
+  IF p_verbose THEN
+    RAISE NOTICE 'lights   : % lit hits in % ms', (SELECT count(*) FROM rt_rad),
       round(extract(epoch FROM clock_timestamp() - ts)::numeric * 1000);
     ts := clock_timestamp();
   END IF;
@@ -272,10 +308,10 @@ BEGIN
   FROM (
     SELECT h.px, h.py,
            sum(shade(h.d, h.h, h.att, m,
-                     coalesce(sh.att, ROW(1,1,1)::vec3))) * (1.0 / (aa * aa)) AS col
+                     coalesce(e.rad, ROW(0,0,0)::vec3))) * (1.0 / (aa * aa)) AS col
     FROM rt_hit h
-         LEFT JOIN material m  ON m.mat_id = (h.h).mat
-         LEFT JOIN rt_shadow sh ON sh.hid = h.hid
+         LEFT JOIN material m ON m.mat_id = (h.h).mat
+         LEFT JOIN rt_rad e   ON e.hid = h.hid
     GROUP BY h.px, h.py
   ) AS q;
 
@@ -284,7 +320,7 @@ BEGIN
       round(extract(epoch FROM clock_timestamp() - ts)::numeric * 1000);
   END IF;
 
-  DROP TABLE rt_ray, rt_new, rt_hit, rt_sray, rt_shadow;
+  DROP TABLE rt_ray, rt_new, rt_hit, rt_sray, rt_shadow, rt_rad;
 END $$ LANGUAGE plpgsql;
 
 -- Convenience wrapper: render and hand back the encoded PNG in one call.

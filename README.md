@@ -55,6 +55,20 @@ VALUES ('flint-glass', mat_glass(),
         ROW(1.60, 1.68, 1.79)::vec3, ROW(0.20, 0.10, 0.12)::vec3, 420.0);
 ```
 
+So is a light. A three-point setup is three rows, and nothing in the transport
+code knows how many there are — it works on `(hit, light)` pairs and sums them:
+
+```sql
+INSERT INTO light (name, p, col, pow) VALUES
+  ('fill', ROW(-4.8, 2.6,  5.2)::vec3, ROW(0.42, 0.55, 1.00)::vec3, 55.0),
+  ('rim',  ROW(-2.2, 3.4, -6.5)::vec3, ROW(1.00, 0.55, 0.30)::vec3, 90.0);
+```
+
+`sky_k` gives a light a disc in the sky, so it shows up in a mirror and in the
+background as well as on the surfaces it lights. Keeping that on the light
+rather than in the sky is what holds the two consistent: move the light and its
+reflection moves with it.
+
 `examples/torus_scene.sql` builds a scene from `examples/torus.obj` — two
 copies of one OBJ at different sizes and angles, wearing different materials:
 
@@ -68,8 +82,8 @@ normals meeting each vertex, weighted by area.
 
 ## What it renders
 
-* **Diffuse** — Lambertian under the key light, with an optional procedural
-  checker and a Fresnel-weighted specular reflection on top.
+* **Diffuse** — Lambertian under every light in the scene, with an optional
+  procedural checker and a Fresnel-weighted specular reflection on top.
 * **Metal** — a conductor, so no diffuse lobe at all: lit entirely by what its
   mirror ray finds, tinted per channel by a Fresnel term whose
   normal-incidence value *is* the metal's colour.
@@ -253,15 +267,16 @@ default 64 MB `/dev/shm`, which is why `docker-compose.yml` sets `shm_size`.
 `render(..., p_verbose => true)` reports each phase. At 240×160, one sample,
 depth 4, on the default 1118-triangle scene:
 
-| phase | rays | time |
+| phase | rows | time |
 |---|---|---|
 | bounce 0 | 38 400 | 0.76 s |
 | bounce 1 | 40 571 | 1.08 s |
 | bounce 2 | 33 912 | 1.09 s |
 | bounce 3 | 36 523 | 0.86 s |
 | bounce 4 | 22 698 | 0.53 s |
-| shadow rays | 49 470 | 1.12 s |
-| shading and tone mapping | | 1.72 s |
+| shadow rays | 49 470 | 1.05 s |
+| direct lighting | 101 892 lit hits | 0.39 s |
+| shading and tone mapping | | 1.34 s |
 
 Absolute timings move a great deal with machine state — the same binary and
 scene measured 1.9× faster earlier in the day on this same laptop — so the
@@ -287,10 +302,10 @@ before the inlining work. The BVH is what keeps it from being 40×.
 | `sql/01_vec3.sql` | `vec3` type, operators, reflection and Snell refraction |
 | `sql/02_png.sql` | CRC-32, Adler-32, DEFLATE, PNG chunk framing |
 | `sql/03_mesh.sql` | mesh/material/triangle tables, intersection, BVH, OBJ loader |
-| `sql/04_scene.sql` | lighting, sky, the default scene |
-| `sql/05_trace.sql` | Fresnel, absorption, shading, ray spawning |
+| `sql/04_scene.sql` | the light table, sky, the default scene |
+| `sql/05_trace.sql` | Fresnel, absorption, direct lighting, ray spawning |
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
-| `test/tests.sql` | 74 checks |
+| `test/tests.sql` | 85 checks |
 | `examples/` | a torus OBJ and the scene that loads it |
 
 ## Notes and limitations
@@ -307,9 +322,17 @@ before the inlining work. The BVH is what keeps it from being 40×.
   inverse-transpose for the normals.
 * Stored DEFLATE blocks mean the PNG is roughly the size of the raw pixels.
   Implementing real Huffman coding in SQL would fix that.
-* The point light gives hard shadows. Area lights would need stochastic
-  sampling, which needs a PRNG — `random()` is `VOLATILE` and would break the
-  planner's assumptions, so it would have to be a hash of the ray index.
+* Lights are points, so shadows are hard-edged. An area light is several rows
+  sampling one emitter — the renderer already sums them and needs no change —
+  but placing those samples well needs a PRNG, and `random()` is `VOLATILE` and
+  would break the planner's assumptions, so it would have to be a hash of the
+  ray index.
+* A light costs one shadow ray per hit it can reach, so cost is linear in the
+  light count where it is not free: measured at 240×160, going from one light
+  to three took the shadow pass from 2.1 s to 6.5 s and the whole frame from
+  17.8 s to 22.4 s. The shading pass does not move at all (2.5 s in both),
+  because everything that depends only on the surface is computed once per hit
+  regardless of how many lights reach it.
 * The ground plane's Fresnel reflectance is capped below its physical value.
   Uncapped, a grazing-angle mirror floor reflects the bright uniform sky
   across the whole lower frame and erases its own shadows.
