@@ -98,7 +98,9 @@ SELECT render_frame(frame_id) FROM frame WHERE png IS NULL ORDER BY frame_id;
 Moving the camera touches no geometry at all — `tri` and the BVH are untouched
 between frames and nothing is reindexed — so this is the one animation that
 costs nothing beyond the frames themselves. Resuming an interrupted sequence is
-`WHERE png IS NULL`.
+`WHERE png IS NULL`, which is also why the rows are inserted before anything is
+traced: the sequence is data, and rendering it is a separate step.
+`examples/orbit.sql` is that, end to end, against whatever scene is loaded.
 
 The row stores the PNG rather than the pixels. `img` holds 8-bit values that
 already went through exposure, the tone curve, gamma and clipping, so keeping
@@ -257,7 +259,7 @@ statement, and CTAS is the one exception), and `docker-compose.yml` raises
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
 | `sql/07_frame.sql` | the frame table and the render that stores its result |
 | `test/tests.sql` | 97 checks |
-| `examples/` | a torus OBJ and the scene that loads it |
+| `examples/` | a torus OBJ, the scene that loads it, and a camera orbit |
 | [`research/`](research) | the measurements behind the design |
 
 ## Notes and limitations
