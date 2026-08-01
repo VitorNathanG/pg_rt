@@ -122,9 +122,10 @@ BEGIN
   FOR dep IN 0 .. maxdepth LOOP
     ts := clock_timestamp();
 
-    -- Intersect every live ray at once.  The mesh box rejects whole objects,
-    -- the BVH leaf rejects clusters of triangles, and only what survives both
-    -- reaches tri_hit.
+    -- Intersect every live ray at once.  Three levels of box, one join each:
+    -- the mesh box rejects whole objects, the BVH leaf rejects clusters of
+    -- triangles, the triangle's own box rejects the triangle, and only what
+    -- survives all three reaches tri_hit.
     DROP TABLE IF EXISTS rt_new;
     CREATE UNLOGGED TABLE rt_new AS
     WITH best AS (
@@ -137,6 +138,8 @@ BEGIN
                            AND box_hit(r.ox, r.oy, r.oz, r.ivx, r.ivy, r.ivz,
                                        n.lox, n.loy, n.loz, n.hix, n.hiy, n.hiz)
            JOIN tri t       ON t.cl = n.cl
+                           AND box_hit(r.ox, r.oy, r.oz, r.ivx, r.ivy, r.ivz,
+                                       t.lox, t.loy, t.loz, t.hix, t.hiy, t.hiz)
            CROSS JOIN LATERAL (
              SELECT tri_hit(r.ox, r.oy, r.oz, r.dx, r.dy, r.dz,
                             t.ax, t.ay, t.az, t.e1x, t.e1y, t.e1z,
@@ -232,6 +235,8 @@ BEGIN
                          AND box_hit(s.ox, s.oy, s.oz, s.ivx, s.ivy, s.ivz,
                                      n.lox, n.loy, n.loz, n.hix, n.hiy, n.hiz)
          JOIN tri t       ON t.cl = n.cl
+                         AND box_hit(s.ox, s.oy, s.oz, s.ivx, s.ivy, s.ivz,
+                                     t.lox, t.loy, t.loz, t.hix, t.hiy, t.hiz)
          JOIN mesh ms     ON ms.mesh_id = n.mesh_id
          JOIN material mm ON mm.mat_id = ms.mat_id
          CROSS JOIN LATERAL (

@@ -252,9 +252,19 @@ DO $x$ BEGIN PERFORM scene_reindex(); END $x$;
 \echo
 \echo == acceleration ==
 
--- Every triangle must lie inside the leaf box that claims it, and every leaf
--- inside its mesh box.  A box that does not contain its contents silently
--- drops geometry from the render.
+-- Every triangle must lie inside its own box, inside the leaf box that claims
+-- it, and every leaf inside its mesh box.  A box that does not contain its
+-- contents silently drops geometry from the render.
+--
+-- The triangle's box is a generated column, so it cannot drift from the
+-- vertices -- but least/greatest transposed would still compile, and would
+-- reject every ray that ought to hit.
+SELECT ok(bool_and((v).x >= t.lox AND (v).x <= t.hix
+               AND (v).y >= t.loy AND (v).y <= t.hiy
+               AND (v).z >= t.loz AND (v).z <= t.hiz),
+          'every triangle lies inside its own box')
+FROM tri t, LATERAL (SELECT unnest(ARRAY[t.a, t.b, t.c])) AS q(v);
+
 SELECT ok(bool_and((v).x >= (n.lo).x - 1e-9 AND (v).x <= (n.hi).x + 1e-9
                AND (v).y >= (n.lo).y - 1e-9 AND (v).y <= (n.hi).y + 1e-9
                AND (v).z >= (n.lo).z - 1e-9 AND (v).z <= (n.hi).z + 1e-9),
