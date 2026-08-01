@@ -145,7 +145,7 @@ scratch:
 
 ## Performance, and what it cost to find
 
-The engine is written around four measured facts. Each one contradicted the
+The engine is written around six measured facts. Each one contradicted the
 obvious approach, so they are recorded here rather than rediscovered.
 
 **1. A SQL function body is macro-expanded into its caller.** Writing
@@ -170,7 +170,29 @@ mentions the inverse direction twelve times. `EXPLAIN` showed the entire
 `ROW(1/nz(...), ...)` expression, with its three divisions, repeated twelve
 times inside one box test.
 
-**3. The executor beats interpreted PL/pgSQL, but only in the right shape.**
+**3. An inlined expression node costs ~2.5 ns; a PL/pgSQL statement ~45 ns.**
+Eighteen times. That crossover is far past where it looks: a fully inlined
+Möller–Trumbore with ~90 duplicated expression nodes beats the PL/pgSQL
+version by 5×, so `tri_hit` is FROM-less SQL over precomputed edges. A
+`(v).x` FieldSelect on a composite costs ~10 ns against ~1 ns for a plain
+`float8` Var, and the inlined slab and triangle tests name their arguments
+some sixty times between them — which is why `tri`, `bvh_node`, `mesh_box`
+and the ray tables all carry a flat `float8` mirror of their vectors as
+`GENERATED ALWAYS ... STORED` columns. Measured over the 460 304 candidate
+pairs of one 240×160 frame: box test 387 → 106 ns, triangle test 1601 → 290 ns.
+
+**4. Inlining fails silently when an argument is expensive.** `inline_function`
+refuses when a parameter the body names more than once is passed an
+expression costing more than `10 * cpu_operator_cost`. The function then runs
+as a real SQL function — a full executor run, microseconds — and **`EXPLAIN`
+shows nothing unusual**. Only timing does. Three instances were live in this
+code: `tri_shading_normal(t, tri_bary(...))` was 900 ms of a 1347 ms query
+from that cause alone. The escapes are to assign the argument to a PL/pgSQL
+local (it becomes a `Param`, cost 0) or to pass components rather than a
+composite. This is the exact mirror of fact 1: there, naming a value twice
+made it compute twice; here, naming it twice stops it inlining at all.
+
+**5. The executor beats interpreted PL/pgSQL, but only in the right shape.**
 Two comparisons, each between shapes doing identical work.
 
 4000 rays against 512 triangles, no acceleration:
@@ -194,7 +216,7 @@ more than the triangle tests they skip. The second says the reduction must not
 sort. Hence a two-level hierarchy expressed as a chain of joins, closed by an
 aggregate.
 
-**4. Leaf size is not sqrt(n).** A triangle test costs about three times a box
+**6. Leaf size is not sqrt(n).** A triangle test costs about three times a box
 test, so the optimum sits well below it. Measured over the default scene's
 1104-triangle ball:
 
@@ -208,6 +230,15 @@ test, so the optimum sits well below it. Measured over the default scene's
 
 `scene_reindex()` defaults to `sqrt(n)/3`, which lands in that basin.
 
+**JIT is off because it was measured, not because it is safer.** These are
+arithmetic-heavy queries over millions of rows, which looks like exactly the
+JIT's target, and it loses badly: +5% at default thresholds, **68× slower**
+with the thresholds at zero, and 3× slower *after* the optimisations above,
+because the newly inlined kernels grew past `jit_above_cost`. The penalty is
+a roughly constant 4.5–5 s per render regardless of resolution — `render()`
+issues a fixed number of distinct queries and each is compiled once per
+execution — so there is no crossover at which it pays back.
+
 A smaller effect, kept because it is free: every ray set is built with
 `CREATE TABLE AS` rather than `INSERT INTO`. PostgreSQL refuses to parallelise
 any statement that writes, with CTAS as the one exception — the identical
@@ -220,29 +251,34 @@ default 64 MB `/dev/shm`, which is why `docker-compose.yml` sets `shm_size`.
 ### Where the time goes
 
 `render(..., p_verbose => true)` reports each phase. At 240×160, one sample,
-depth 4, on the default 1118-triangle scene — intersection is the whole cost,
-and it is spread evenly across bounces because the glass keeps spawning rays:
+depth 4, on the default 1118-triangle scene:
 
 | phase | rays | time |
 |---|---|---|
-| bounce 0 | 38 400 | 1.5 s |
-| bounce 1 | 40 571 | 1.9 s |
-| bounce 2 | 33 979 | 2.0 s |
-| bounce 3 | 37 701 | 1.6 s |
-| bounce 4 | 24 708 | 0.9 s |
-| shadow rays | 46 573 | 1.2 s |
-| shading and tone mapping | | 1.0 s |
+| bounce 0 | 38 400 | 0.76 s |
+| bounce 1 | 40 571 | 1.08 s |
+| bounce 2 | 33 912 | 1.09 s |
+| bounce 3 | 36 523 | 0.86 s |
+| bounce 4 | 22 698 | 0.53 s |
+| shadow rays | 49 470 | 1.12 s |
+| shading and tone mapping | | 1.72 s |
 
-| resolution | samples | depth | time |
-|---|---|---|---|
-| 120×80 | 1 | 4 | 2.9 s |
-| 240×160 | 1 | 4 | 11.6 s |
-| 480×320 | 2×2 | 5 | 186 s |
-| 600×400 | 2×2 | 5 | 301 s |
+Absolute timings move a great deal with machine state — the same binary and
+scene measured 1.9× faster earlier in the day on this same laptop — so the
+table below gives before and after **measured back-to-back in one session**.
+Only the ratio carries across machines.
 
-This is roughly 3–4× the cost of the fixed-geometry version it replaced, which
-tested three analytic primitives per ray instead of intersecting a mesh. That
-is the price of general geometry; the BVH is what keeps it from being 40×.
+| resolution | samples | depth | before | after |
+|---|---|---|---|---|
+| 120×80 | 1 | 4 | 5.6 s | **2.6 s** |
+| 240×160 | 1 | 4 | 22.0 s | **10.1 s** |
+| 480×320 | 2×2 | 5 | — | 144 s |
+| 600×400 | 2×2 | 5 | — | 243 s |
+
+Against the fixed-geometry version this replaced — three analytic primitives
+per ray, no mesh at all — the same frame measures 5.98 s to this engine's
+10.1 s, so general geometry now costs **1.7×** rather than the 3.7× it cost
+before the inlining work. The BVH is what keeps it from being 40×.
 
 ## Layout
 
