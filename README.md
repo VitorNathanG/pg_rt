@@ -1,76 +1,133 @@
 # pg_rt — a raytracer in PostgreSQL 17
 
 A recursive raytracer that runs entirely inside PostgreSQL and returns a PNG as
-a `bytea`. No extensions, no procedural language beyond the two that ship in
-core, no external image library — the PNG container, its checksums and its
-DEFLATE stream are all built in SQL.
+a `bytea`. It renders arbitrary triangular meshes with selectable materials.
+No extensions, no procedural language beyond the two that ship in core, no
+external image library — the PNG container, its checksums and its DEFLATE
+stream are all built in SQL.
 
 ```sql
-SELECT render(720, 480, 2, 6);              -- trace into the table `img`
-SELECT png_encode(720, 480, png_scanlines('img'));   -- -> bytea
+SELECT render(600, 400, 2, 5);                       -- trace into the table `img`
+SELECT png_encode(600, 400, png_scanlines('img'));   -- -> bytea
 ```
 
 ![render](out.png)
 
-A checkered ground plane, a metal sphere, and a glass cube with dispersion.
+A checkered ground plane, a metal sphere and a glass cube — all three are
+triangle meshes, and the tracer does not know which is which.
 
 ## Running it
 
 ```bash
 docker compose up -d      # PostgreSQL 17
-./load.sh                 # install the engine
-./test.sh                 # 41 checks on the encoders and the optics
-./render.sh 720 480 2 6   # width height samples-per-axis max-depth -> out.png
+./load.sh                 # install the engine and build the default scene
+./test.sh                 # 74 checks on the encoders, the geometry and the optics
+./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
+
+## Geometry lives in tables
+
+A scene is rows. Meshes hold triangles, triangles carry optional vertex
+normals, and each mesh points at a material:
+
+```sql
+SELECT mesh_add_sphere('ball', 'chrome', 1.0, ROW(-1.15, 1.0, -0.2)::vec3, 24);
+SELECT mesh_load_obj('bunny', 'crown-glass', :'obj_text',
+                     0.9, radians(30), ROW(1.4, 0.9, 0.6)::vec3);
+SELECT scene_reindex();          -- rebuild the BVH after any change
+```
+
+Changing how something looks is an `UPDATE` of one foreign key — the geometry
+is not touched:
+
+```sql
+SELECT mesh_set_material('ball', 'crown-glass');
+```
+
+A material is a row. `kind` selects the model (diffuse, metal, dielectric) and
+the rest are its parameters, including a per-channel index of refraction, so a
+second glass with a different dispersion is another `INSERT` rather than
+another code path:
+
+```sql
+INSERT INTO material (name, kind, ior, absorb, spec_e)
+VALUES ('flint-glass', mat_glass(),
+        ROW(1.60, 1.68, 1.79)::vec3, ROW(0.20, 0.10, 0.12)::vec3, 420.0);
+```
+
+`examples/torus_scene.sql` builds a scene from `examples/torus.obj` — two
+copies of one OBJ at different sizes and angles, wearing different materials:
+
+![torus](examples/torus.png)
+
+The OBJ reader handles `v`, `vn` and `f`, polygons of any size
+(fan-triangulated), all of the `1`, `1/2`, `1//3` and `1/2/3` corner
+spellings, and negative (relative) indices. A mesh loaded without normals can
+be smoothed after the fact with `mesh_smooth()`, which averages the facet
+normals meeting each vertex, weighted by area.
 
 ## What it renders
 
-* **Ground plane** — checkerboard albedo, Lambertian diffuse under the key
-  light, with a Fresnel-weighted specular reflection on top.
-* **Metal sphere** — a conductor, so no diffuse lobe at all: it is lit
-  entirely by what its mirror ray finds, tinted per channel by a Fresnel term
-  whose normal-incidence value *is* the metal's colour.
-* **Glass cube** — an oriented box with Snell refraction, Schlick–Fresnel
-  reflection, total internal reflection past the critical angle, and
-  Beer–Lambert absorption over the true path length through the glass.
+* **Diffuse** — Lambertian under the key light, with an optional procedural
+  checker and a Fresnel-weighted specular reflection on top.
+* **Metal** — a conductor, so no diffuse lobe at all: lit entirely by what its
+  mirror ray finds, tinted per channel by a Fresnel term whose
+  normal-incidence value *is* the metal's colour.
+* **Dielectric** — Snell refraction, Schlick–Fresnel reflection, total internal
+  reflection past the critical angle, and Beer–Lambert absorption over the true
+  path length through the medium.
 
 ### Dispersion
 
-The cube's index of refraction differs per channel (1.470 / 1.530 / 1.605), so
-white light entering it splits. A ray carries a `chan` tag: `0` means it still
-stands for all three wavelengths, `1`–`3` mean it has been committed to one.
-At the first glass surface an undispersed ray spawns *three* refracted
-children, each masked down to its own channel and bent by its own index; from
-then on each follows a measurably different path. At 45° incidence red and
-blue separate by 2.6°, which is what puts the coloured fringes along the cube's
-edges.
+A dielectric's index of refraction differs per channel (1.470 / 1.530 / 1.605
+for the default glass), so white light entering it splits. A ray carries a
+`chan` tag: `0` means it still stands for all three wavelengths, `1`–`3` mean
+it has been committed to one. At the first glass surface an undispersed ray
+spawns *three* refracted children, each masked down to its own channel and
+bent by its own index; from then on each follows a measurably different path.
+At 45° incidence red and blue separate by 2.6°, which is what puts the coloured
+fringes along the glass edges.
 
-Shadow rays are attenuated rather than binary, so the cube casts a tinted
-shadow whose colour comes from Beer–Lambert absorption over the thickness the
-ray actually traverses.
+Shadow rays are attenuated rather than binary, so glass casts a tinted shadow
+whose colour comes from Beer–Lambert absorption over the thickness the ray
+actually traverses.
 
 ## How it works
 
-### The tracer is one recursive CTE
+### One set-based pass per bounce
 
-There is no per-pixel loop. `render()` issues a single `WITH RECURSIVE` query
-whose rows are *hit records* — a ray that has already found its surface. The
-base term fires `aa²` primary rays per pixel and intersects them. The recursive
-term turns every live hit into its reflected and refracted children and
-intersects those. Every ray at a given bounce depth is traced in one
-set-oriented pass, and the whole image falls out of one `GROUP BY`:
+There is no per-pixel loop. Every ray alive at a given bounce depth is
+intersected by a *single* query: a join from the ray set through the mesh
+boxes, through the BVH leaves, down to the triangles, reduced to one nearest
+hit per ray by a hash aggregate.
 
 ```sql
-SELECT px, py, sum(shade(d, h, att)) FROM trace GROUP BY px, py
+SELECT r.rid, nearest(ROW(x.t, t.tri_id)::cand)
+FROM rt_ray r
+     JOIN mesh_box mb ON box_hit(r.o, r.iv, mb.lo, mb.hi)
+     JOIN bvh_node n  ON n.mesh_id = mb.mesh_id AND box_hit(r.o, r.iv, n.lo, n.hi)
+     JOIN tri t       ON t.cl = n.cl
+     CROSS JOIN LATERAL (SELECT tri_hit(r.o, r.d, t.a, t.b, t.c) OFFSET 0) AS x(t)
+WHERE x.t IS NOT NULL
+GROUP BY r.rid;
 ```
 
-Rows die when they exceed the depth limit or when their throughput drops below
-a cutoff, which is what keeps the branching factor from exploding through the
-glass.
+`nearest` is a custom aggregate that keeps the smallest `t`. Reducing millions
+of candidates with `DISTINCT ON` would mean sorting all of them; an aggregate
+does it in one hash pass, and a combine function makes it parallel-safe.
 
-Modelling rows as hits rather than as rays is what makes this cheap: each ray
-is intersected exactly once, and the shading at a hit is evaluated with the
-geometry already in hand.
+**This used to be one recursive CTE, and it cannot stay that way.** A
+set-based intersection has to aggregate many candidate triangles down to one
+nearest hit, and PostgreSQL forbids aggregates in a recursive term:
+
+```
+ERROR:  aggregate functions are not allowed in a recursive query's recursive term
+```
+
+So the recursion is unrolled by one level into a bounce loop, and the work
+inside each iteration becomes an ordinary aggregating join. The loop is
+bounded by `maxdepth` and exits early when no rays survive the throughput
+cutoff.
 
 ### The PNG is built byte by byte in SQL
 
@@ -86,58 +143,106 @@ scratch:
   DEFLATE block, so the output is a fully conformant PNG that stock decoders
   read; it is simply about as large as the raw pixel data.
 
-`test.sh` checks the checksums against their published vectors, and the
-rendered file decompresses cleanly under real zlib.
+## Performance, and what it cost to find
 
-## The performance problem, and the fix
+The engine is written around four measured facts. Each one contradicted the
+obvious approach, so they are recorded here rather than rediscovered.
 
-The first working version took **over two minutes for a 120×80 image**. The
-cause was not the algorithm — it was a PostgreSQL evaluation trap worth
-knowing about.
-
-**A SQL function body is macro-expanded into its caller.** So when you write
+**1. A SQL function body is macro-expanded into its caller.** Writing
 
 ```sql
 LATERAL (SELECT child_ray(...)) AS c(r)
 ```
 
-and then reference `(c.r).o`, `(c.r).d`, `(c.r).att`, `(c.r).chan`, the planner
-flattens that subquery and substitutes the *entire `child_ray(...)` call at
-every one of those references*. Six references meant six evaluations. The same
-thing happened one level down inside `scene_hit`, which referenced its own
-intermediate `t` about eight times — each one re-running `hit_cube`, which
-re-ran `to_cube` twelve times. The factors multiply. A single ray was costing
-thousands of redundant evaluations.
+and then reading `(c.r).o`, `(c.r).d`, `(c.r).att`, `(c.r).chan` substitutes
+the *entire call* at every one of those references. This is why `OFFSET 0`
+appears on the LATERAL joins — it is an optimisation fence that blocks
+subquery pull-up — and why leaf math has no `FROM` clause (PostgreSQL only
+inlines a SQL function whose body is a single `SELECT` with an empty range
+table), while anything reusing an intermediate is PL/pgSQL. In the
+fixed-geometry version this trap alone took a 120×80 render from *over two
+minutes* to 0.76 s.
 
-Three changes fixed it, and the code is written to keep them true:
+**2. The fence is not always enough — a ray must carry its inverse direction
+as a real column.** Computing it in a `LATERAL` looks equivalent, but the
+planner pulls a single-row `Result` up into the join filter, and the slab test
+mentions the inverse direction twelve times. `EXPLAIN` showed the entire
+`ROW(1/nz(...), ...)` expression, with its three divisions, repeated twelve
+times inside one box test.
 
-1. **`OFFSET 0` on the LATERAL joins in the tracing query.** It is an
-   optimisation fence that blocks subquery pull-up, so each function is
-   evaluated once and its result read as a real column. Load-bearing, not
-   decoration.
-2. **Leaf math has no `FROM` clause.** PostgreSQL only inlines a SQL function
-   whose body is a single `SELECT` with an empty range table. Written that way,
-   `v3_dot` and friends fold into the caller's expression tree instead of
-   costing a call each. Where that means recomputing a square root three times,
-   that is still far cheaper than the call it avoids.
-3. **Anything that reuses an intermediate is PL/pgSQL.** A local variable is
-   computed exactly once. This is why `scene_hit`, `hit_cube`, `shade` and
-   `child_ray` are procedural while the vector algebra is not — the split is
-   about evaluation counts, not about taste.
+**3. The executor beats interpreted PL/pgSQL, but only in the right shape.**
+Two comparisons, each between shapes doing identical work.
 
-Result: the 120×80 render that had not finished in 120 s now takes **0.76 s**,
-and cost is linear in pixels again.
+4000 rays against 512 triangles, no acceleration:
+
+| shape | time |
+|---|---|
+| set-based join, one PL/pgSQL call per (ray, triangle) | **145 ms** |
+| PL/pgSQL loop over the same geometry held in an array | 1311 ms |
+
+16 000 rays against the 514-triangle scene:
+
+| shape | time |
+|---|---|
+| set-based join through the BVH | **388 ms** |
+| per-ray correlated subquery through the BVH | 1097 ms |
+| every ray against every triangle, `DISTINCT ON` for the nearest | 10 036 ms |
+
+The first pair says a per-ray tree walk with an explicit stack — the textbook
+BVH traversal — is the *wrong* design here: interpreted loop iterations cost
+more than the triangle tests they skip. The second says the reduction must not
+sort. Hence a two-level hierarchy expressed as a chain of joins, closed by an
+aggregate.
+
+**4. Leaf size is not sqrt(n).** A triangle test costs about three times a box
+test, so the optimum sits well below it. Measured over the default scene's
+1104-triangle ball:
+
+| leaf size | leaves | triangles tested per ray | time |
+|---|---|---|---|
+| 4 | 280 | 6.5 | 905 ms |
+| **8** | **141** | **10.0** | **798 ms** |
+| 12 | 94 | 12.1 | 810 ms |
+| 20 | 58 | 18.8 | 1025 ms |
+| 40 | 30 | 30.1 | 1446 ms |
+
+`scene_reindex()` defaults to `sqrt(n)/3`, which lands in that basin.
+
+A smaller effect, kept because it is free: every ray set is built with
+`CREATE TABLE AS` rather than `INSERT INTO`. PostgreSQL refuses to parallelise
+any statement that writes, with CTAS as the one exception — the identical
+query gets a `Gather` as a CTAS and none at all as an `INSERT ... SELECT`.
+Worth about 9%; the planner still assigns only one worker, because it sizes
+workers by page count and a ray table is small no matter how much arithmetic
+each row costs. Parallel workers also need more shared memory than Docker's
+default 64 MB `/dev/shm`, which is why `docker-compose.yml` sets `shm_size`.
+
+### Where the time goes
+
+`render(..., p_verbose => true)` reports each phase. At 240×160, one sample,
+depth 4, on the default 1118-triangle scene — intersection is the whole cost,
+and it is spread evenly across bounces because the glass keeps spawning rays:
+
+| phase | rays | time |
+|---|---|---|
+| bounce 0 | 38 400 | 1.5 s |
+| bounce 1 | 40 571 | 1.9 s |
+| bounce 2 | 33 979 | 2.0 s |
+| bounce 3 | 37 701 | 1.6 s |
+| bounce 4 | 24 708 | 0.9 s |
+| shadow rays | 46 573 | 1.2 s |
+| shading and tone mapping | | 1.0 s |
 
 | resolution | samples | depth | time |
 |---|---|---|---|
-| 120×80 | 1 | 4 | 0.76 s |
-| 240×160 | 1 | 5 | 3.1 s |
-| 480×320 | 1 | 5 | 12.6 s |
-| 480×320 | 2×2 | 5 | 52 s |
-| 720×480 | 2×2 | 6 | 116 s |
+| 120×80 | 1 | 4 | 2.9 s |
+| 240×160 | 1 | 4 | 11.6 s |
+| 480×320 | 2×2 | 5 | 186 s |
+| 600×400 | 2×2 | 5 | 301 s |
 
-Encoding the 720×480 PNG — a megabyte of CRC-32 through a PL/pgSQL loop plus
-the Adler-32 aggregate — adds about 0.6 s on top.
+This is roughly 3–4× the cost of the fixed-geometry version it replaced, which
+tested three analytic primitives per ray instead of intersecting a mesh. That
+is the price of general geometry; the BVH is what keeps it from being 40×.
 
 ## Layout
 
@@ -145,21 +250,33 @@ the Adler-32 aggregate — adds about 0.6 s on top.
 |---|---|
 | `sql/01_vec3.sql` | `vec3` type, operators, reflection and Snell refraction |
 | `sql/02_png.sql` | CRC-32, Adler-32, DEFLATE, PNG chunk framing |
-| `sql/03_scene.sql` | scene constants, ray/shape intersections, `scene_hit` |
-| `sql/04_trace.sql` | Fresnel, absorption, shadows, shading, ray spawning |
-| `sql/05_render.sql` | camera, tone mapping, the recursive CTE |
-| `test/tests.sql` | 41 checks on the encoders and the optics |
+| `sql/03_mesh.sql` | mesh/material/triangle tables, intersection, BVH, OBJ loader |
+| `sql/04_scene.sql` | lighting, sky, the default scene |
+| `sql/05_trace.sql` | Fresnel, absorption, shading, ray spawning |
+| `sql/06_render.sql` | camera, tone mapping, the bounce loop |
+| `test/tests.sql` | 74 checks |
+| `examples/` | a torus OBJ and the scene that loads it |
 
 ## Notes and limitations
 
-* Stored DEFLATE blocks mean the PNG is roughly the size of the raw pixels
-  (~1 MB at 720×480). Implementing real Huffman coding in SQL would fix that
-  and is the obvious next step.
+* The BVH is two levels deep because the number of join levels has to be
+  written into the query text. A tree of arbitrary depth would need a
+  recursive descent per bounce, which is expressible now that the bounce loop
+  is no longer itself a recursive CTE — it is the obvious next step, and it is
+  what a scene of 100k triangles would need.
+* `scene_reindex()` must be called after changing geometry. New triangles have
+  no BVH leaf until it runs, and the renderer will not see them.
+* Placement is scale, pitch and yaw. That is enough to aim a mesh but not to
+  shear or mirror one; a real 4×4 transform would need a type and an
+  inverse-transpose for the normals.
+* Stored DEFLATE blocks mean the PNG is roughly the size of the raw pixels.
+  Implementing real Huffman coding in SQL would fix that.
 * The point light gives hard shadows. Area lights would need stochastic
   sampling, which needs a PRNG — `random()` is `VOLATILE` and would break the
-  recursive CTE's assumptions, so it would have to be a hash of the ray index.
+  planner's assumptions, so it would have to be a hash of the ray index.
 * The ground plane's Fresnel reflectance is capped below its physical value.
-  Uncapped, a grazing-angle mirror floor reflects the bright uniform sky across
-  the whole lower frame and erases its own shadows.
-* No spatial index: with three objects, every ray tests every shape. A BVH
-  would matter the moment the scene grew.
+  Uncapped, a grazing-angle mirror floor reflects the bright uniform sky
+  across the whole lower frame and erases its own shadows.
+* Glass shows some speckle at one sample per pixel: three refracted channels
+  each take a different path, and where one of them hits a checker edge the
+  disagreement shows up as a coloured pixel. More samples per pixel resolve it.
