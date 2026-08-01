@@ -2,47 +2,52 @@
 -- Camera and the render driver.
 -- ---------------------------------------------------------------------------
 
+-- The default camera.  A render may be given any other, so these are where a
+-- view starts rather than what it is: render() takes p_from / p_at / p_fov and
+-- falls back to these, and a `frame` row records the one actually used.
 CREATE FUNCTION cam_from() RETURNS vec3   AS $$ SELECT ROW(0.55, 2.35, 6.70)::vec3 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 CREATE FUNCTION cam_at()   RETURNS vec3   AS $$ SELECT ROW(0.05, 1.00, 0.00)::vec3 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 CREATE FUNCTION cam_fov()  RETURNS float8 AS $$ SELECT 44.0 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
--- Direction through a point on the image plane.  nx and ny are normalised
--- device coordinates in [-1, 1], with ny pointing up.
+-- The basis, from a camera rather than from constants.
 --
--- The basis depends only on IMMUTABLE constants, so the planner *should* fold
--- it to three literal vectors before the query executes -- and for a long time
--- this claimed it did while it did not.  `v3_unit(cam_from() - cam_at())`
--- hands v3_unit an argument for a parameter its body names twenty-one times,
--- which stops it inlining; unable to inline, the planner cannot fold it
--- either, so cam_w stayed a live function call, cam_u and cam_v inherited it,
--- and cam_dir cost four executor runs per camera ray.  Nothing showed it but
--- auto_explain's nested-statement log.
+-- These took no arguments once, and read the constants above directly, which
+-- let the planner fold the whole basis to three literal vectors before any
+-- query ran.  That is not available to a camera that can change per render --
+-- and it is worth being precise about what was actually lost, because it is
+-- less than it looks.  Folding happened once per *query*, and the basis is
+-- constant across a whole frame either way; what render() does instead is
+-- compute it once into PL/pgSQL locals, which reach cam_dir as Params.  A
+-- Param costs nothing to inline over, so the arithmetic below still collapses
+-- into the ray query exactly as it did.  The saving that is gone is three
+-- vector normalisations per frame.
 --
--- The component form of v3_unit takes three separate parameters, so the
--- threshold applies per component and each argument here is a constant fold
--- away from nothing.  With cam_w foldable the whole basis collapses, and
--- cam_dir below is then pure arithmetic over literals.
-CREATE FUNCTION cam_w() RETURNS vec3
-  AS $$ SELECT v3_unit((cam_from()).x - (cam_at()).x,
-                       (cam_from()).y - (cam_at()).y,
-                       (cam_from()).z - (cam_at()).z) $$
+-- What must not come back is the older failure, which was expensive: passing a
+-- whole vec3 to v3_unit hands an argument to a parameter its body names
+-- twenty-one times, and inlining stops silently.  Every one of these is in
+-- component form for that reason, and test/tests.sql pins it.
+CREATE FUNCTION cam_w(f vec3, a vec3) RETURNS vec3
+  AS $$ SELECT v3_unit((f).x - (a).x,
+                       (f).y - (a).y,
+                       (f).z - (a).z) $$
   LANGUAGE sql IMMUTABLE PARALLEL SAFE;
-CREATE FUNCTION cam_u() RETURNS vec3
-  AS $$ SELECT v3_unit((v3_cross(ROW(0,1,0)::vec3, cam_w())).x,
-                       (v3_cross(ROW(0,1,0)::vec3, cam_w())).y,
-                       (v3_cross(ROW(0,1,0)::vec3, cam_w())).z) $$
+CREATE FUNCTION cam_u(w vec3) RETURNS vec3
+  AS $$ SELECT v3_unit((v3_cross(ROW(0,1,0)::vec3, w)).x,
+                       (v3_cross(ROW(0,1,0)::vec3, w)).y,
+                       (v3_cross(ROW(0,1,0)::vec3, w)).z) $$
   LANGUAGE sql IMMUTABLE PARALLEL SAFE;
-CREATE FUNCTION cam_v() RETURNS vec3
-  AS $$ SELECT v3_cross(cam_w(), cam_u()) $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+CREATE FUNCTION cam_v(w vec3, u vec3) RETURNS vec3
+  AS $$ SELECT v3_cross(w, u) $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
-CREATE FUNCTION cam_dir(nx float8, ny float8, aspect float8) RETURNS vec3 AS $$
+-- Direction through a point on the image plane.  nx and ny are normalised
+-- device coordinates in [-1, 1], with ny pointing up; u, v and w are the
+-- basis and th is tan(fov/2), all four constant for the frame.
+CREATE FUNCTION cam_dir(nx float8, ny float8, aspect float8,
+                        u vec3, v vec3, w vec3, th float8) RETURNS vec3 AS $$
   SELECT v3_unit(
-    (cam_u()).x * (nx * aspect * tan(radians(cam_fov()) / 2.0))
-      + (cam_v()).x * (ny * tan(radians(cam_fov()) / 2.0)) - (cam_w()).x,
-    (cam_u()).y * (nx * aspect * tan(radians(cam_fov()) / 2.0))
-      + (cam_v()).y * (ny * tan(radians(cam_fov()) / 2.0)) - (cam_w()).y,
-    (cam_u()).z * (nx * aspect * tan(radians(cam_fov()) / 2.0))
-      + (cam_v()).z * (ny * tan(radians(cam_fov()) / 2.0)) - (cam_w()).z)
+    (u).x * (nx * aspect * th) + (v).x * (ny * th) - (w).x,
+    (u).y * (nx * aspect * th) + (v).y * (ny * th) - (w).y,
+    (u).z * (nx * aspect * th) + (v).z * (ny * th) - (w).z)
 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- Extended Reinhard tone mapping followed by a gamma 2.2 transfer, quantised
@@ -84,13 +89,28 @@ END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
 CREATE FUNCTION render(img_w int, img_h int, aa int DEFAULT 2, maxdepth int DEFAULT 5,
                        exposure float8 DEFAULT 1.35, cutoff float8 DEFAULT 0.01,
-                       p_verbose boolean DEFAULT false)
+                       p_verbose boolean DEFAULT false,
+                       p_from vec3 DEFAULT cam_from(),
+                       p_at vec3 DEFAULT cam_at(),
+                       p_fov float8 DEFAULT cam_fov())
 RETURNS void AS $$
 DECLARE
   dep  int;
   live bigint;
   ts   timestamptz;
+  -- The camera basis, once per frame.  These reach cam_dir as Params, which
+  -- is what keeps it inlining now that the basis is no longer a constant the
+  -- planner can fold; see the note on cam_w above.
+  cu   vec3;
+  cv   vec3;
+  cw   vec3;
+  cth  float8;
 BEGIN
+  cw  := cam_w(p_from, p_at);
+  cu  := cam_u(cw);
+  cv  := cam_v(cw, cu);
+  cth := tan(radians(p_fov) / 2.0);
+
   DROP TABLE IF EXISTS img;
   CREATE UNLOGGED TABLE img (x int, y int, r int, g int, b int);
 
@@ -157,8 +177,8 @@ BEGIN
   -- reads it.
   CREATE UNLOGGED TABLE rt_ray AS
   SELECT row_number() OVER () AS rid, gx.px, gy.py,
-         cam_from() AS o, cr.dir AS d,
-         (cam_from()).x AS ox, (cam_from()).y AS oy, (cam_from()).z AS oz,
+         p_from AS o, cr.dir AS d,
+         (p_from).x AS ox, (p_from).y AS oy, (p_from).z AS oz,
          (cr.dir).x AS dx, (cr.dir).y AS dy, (cr.dir).z AS dz,
          (v3_inv(cr.dir)).x AS ivx, (v3_inv(cr.dir)).y AS ivy,
          (v3_inv(cr.dir)).z AS ivz,
@@ -177,7 +197,8 @@ BEGIN
        LATERAL (SELECT 2.0 * ((gx.px + (sx.i + 0.5) / aa) / img_w) - 1.0,
                        1.0 - 2.0 * ((gy.py + (sy.j + 0.5) / aa) / img_h)
                 OFFSET 0) AS nd(nx, ny),
-       LATERAL (SELECT cam_dir(nd.nx, nd.ny, img_w::float8 / img_h)
+       LATERAL (SELECT cam_dir(nd.nx, nd.ny, img_w::float8 / img_h,
+                               cu, cv, cw, cth)
                 OFFSET 0) AS cr(dir);
   ALTER TABLE rt_ray SET (parallel_workers = 4);
   ANALYZE rt_ray;
@@ -421,8 +442,11 @@ END $$ LANGUAGE plpgsql;
 
 -- Convenience wrapper: render and hand back the encoded PNG in one call.
 CREATE FUNCTION render_png(w int DEFAULT 480, h int DEFAULT 320, aa int DEFAULT 2,
-                           maxdepth int DEFAULT 6, exposure float8 DEFAULT 1.35)
+                           maxdepth int DEFAULT 6, exposure float8 DEFAULT 1.35,
+                           p_from vec3 DEFAULT cam_from(),
+                           p_at vec3 DEFAULT cam_at(),
+                           p_fov float8 DEFAULT cam_fov())
 RETURNS bytea AS $$
-  SELECT render(w, h, aa, maxdepth, exposure);
+  SELECT render(w, h, aa, maxdepth, exposure, 0.01, false, p_from, p_at, p_fov);
   SELECT png_encode(w, h, png_scanlines('img'));
 $$ LANGUAGE sql;

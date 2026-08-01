@@ -523,25 +523,46 @@ SELECT ok(raises($$INSERT INTO light (name, p) VALUES ('nowhere', ROW(0,0,0)::ve
 -- slower clock -- so it is worth pinning down the two places where the failure
 -- is cheaply visible.
 
--- The camera basis depends only on IMMUTABLE constants, so it must reduce to
--- literal vectors before any query executes.  It did not for a long while:
--- v3_unit over a whole vec3 names its argument twenty-one times, which put
--- cam_w over the threshold and left the entire basis as live calls.
-SELECT ok(plan_of('SELECT cam_w()') NOT LIKE '%cam_%'
-      AND plan_of('SELECT cam_u()') NOT LIKE '%cam_%'
-      AND plan_of('SELECT cam_v()') NOT LIKE '%cam_%',
+-- The camera basis over constant arguments must still reduce to literal
+-- vectors.  It did not for a long while: v3_unit over a whole vec3 names its
+-- argument twenty-one times, which put cam_w over the threshold and left the
+-- entire basis as live calls.
+SELECT ok(plan_of('SELECT cam_w(cam_from(), cam_at())') NOT LIKE '%cam_%'
+      AND plan_of('SELECT cam_u(cam_w(cam_from(), cam_at()))') NOT LIKE '%cam_%'
+      AND plan_of('SELECT cam_v(cam_w(cam_from(), cam_at()),
+                                cam_u(cam_w(cam_from(), cam_at())))')
+            NOT LIKE '%cam_%',
           'the camera basis folds to literal vectors before execution');
 
--- And cam_dir must fold at the shape the renderer actually calls it: device
--- coordinates materialised by a LATERAL, so they arrive as plain Vars.  The
--- `OFFSET 0` is what makes them Vars -- without it the subquery is pulled up,
--- the arithmetic is spliced back into the argument, and v3_unit stops
--- inlining again.  That is not hypothetical; it is what this test caught.
-SELECT ok(plan_of($q$SELECT cam_dir(t.nx, t.ny, 1.5)
-                     FROM generate_series(1,1) g,
-                          LATERAL (SELECT g / 10.0, g / 20.0 OFFSET 0)
-                            AS t(nx, ny)$q$)
-            NOT LIKE '%v3_unit%',
+-- And cam_dir must fold at the shape the renderer actually calls it, which is
+-- now two things at once: device coordinates materialised by a LATERAL, and
+-- the basis arriving from PL/pgSQL locals as Params.  Both matter.  Without
+-- the `OFFSET 0` the subquery is pulled up, the arithmetic is spliced back
+-- into the argument, and v3_unit stops inlining -- that is not hypothetical,
+-- it is what this test caught once.  The Params are the newer half: the basis
+-- used to be a foldable constant and is now per-render, and it is only
+-- because a Param costs nothing to inline over that this still holds.
+CREATE OR REPLACE FUNCTION cam_dir_plan() RETURNS text AS $$
+DECLARE
+  cu vec3; cv vec3; cw vec3; cth float8;
+  r text; acc text := '';
+BEGIN
+  cw  := cam_w(cam_from(), cam_at());
+  cu  := cam_u(cw);
+  cv  := cam_v(cw, cu);
+  cth := tan(radians(cam_fov()) / 2.0);
+  FOR r IN EXECUTE
+    'EXPLAIN (VERBOSE, COSTS OFF)
+     SELECT cam_dir(t.nx, t.ny, 1.5, $1, $2, $3, $4)
+     FROM generate_series(1,1) g,
+          LATERAL (SELECT g / 10.0, g / 20.0 OFFSET 0) AS t(nx, ny)'
+    USING cu, cv, cw, cth
+  LOOP acc := acc || r || E'\n'; END LOOP;
+  RETURN acc;
+END $$ LANGUAGE plpgsql;
+
+SELECT ok(cam_dir_plan() NOT LIKE '%cam_dir%'
+      AND cam_dir_plan() NOT LIKE '%v3_unit%',
           'cam_dir inlines completely at the renderer''s call shape');
 
 -- The slab and triangle tests are the hot path; if either stops inlining the
@@ -590,3 +611,47 @@ SELECT render(24, 16, 1, 3);
 SELECT ok(count(*) > 20, 'a blue fill light lifts the blue channel of the frame')
 FROM img i JOIN one_light o USING (x, y) WHERE i.b > o.b;
 DELETE FROM light WHERE name = 'fill';
+
+\echo
+\echo == camera ==
+
+-- A camera moved along its own view axis must change the picture.  This looks
+-- like a strange thing to single out until you notice it is the one motion
+-- that leaves cam_dir's output *identical*: the basis is built from
+-- unit(from - at), so sliding the eye toward the target rescales that vector
+-- and normalises back to the same w, u and v.  Only the ray origin differs.
+--
+-- So an implementation that threads the new camera into the direction and
+-- leaves the origin reading the old constant renders this case bit-identical
+-- while looking entirely correct from every other angle.  That is exactly the
+-- bug this check was written for, and it is why moving the camera sideways
+-- would not have caught it.
+CREATE TEMP TABLE cam_far AS SELECT * FROM img WHERE false;
+SELECT render(48, 32, 1, 3);
+INSERT INTO cam_far SELECT * FROM img;
+
+SELECT render(48, 32, 1, 3, 1.35, 0.01, false,
+              v3((cam_at()).x + ((cam_from()).x - (cam_at()).x) * 0.5,
+                 (cam_at()).y + ((cam_from()).y - (cam_at()).y) * 0.5,
+                 (cam_at()).z + ((cam_from()).z - (cam_at()).z) * 0.5),
+              cam_at(), cam_fov());
+SELECT ok(count(*) > 0, 'dollying the camera along its view axis changes the frame')
+FROM img i JOIN cam_far f USING (x, y)
+WHERE (i.r, i.g, i.b) IS DISTINCT FROM (f.r, f.g, f.b);
+
+-- ... and passing the defaults explicitly must change nothing at all.
+SELECT render(48, 32, 1, 3, 1.35, 0.01, false, cam_from(), cam_at(), cam_fov());
+SELECT ok(count(*) = 0, 'an explicit default camera renders the default frame')
+FROM img i JOIN cam_far f USING (x, y)
+WHERE (i.r, i.g, i.b) IS DISTINCT FROM (f.r, f.g, f.b);
+
+-- A wider field of view must see more than a narrow one.  Checked on the sky:
+-- the scene sits below the horizon line, so widening the lens can only add
+-- background, never remove it.
+SELECT render(48, 32, 1, 3, 1.35, 0.01, false, cam_from(), cam_at(), 20.0);
+CREATE TEMP TABLE cam_narrow AS SELECT * FROM img;
+SELECT render(48, 32, 1, 3, 1.35, 0.01, false, cam_from(), cam_at(), 80.0);
+SELECT ok((SELECT count(*) FROM img WHERE r = g AND g = b AND r > 150)
+        > (SELECT count(*) FROM cam_narrow WHERE r = g AND g = b AND r > 150),
+          'a wider field of view puts more sky in the frame');
+

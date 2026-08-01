@@ -190,6 +190,24 @@ the device coordinates in a plain `LATERAL`, subquery pull-up splices the
 arithmetic back into the argument and `v3_unit` un-inlines again. The `OFFSET 0`
 is load-bearing.
 
+### What survived making the camera a per-render argument
+
+Folding the basis to literals was only ever available because the camera was
+three `IMMUTABLE` constants. It is not, now that a render can be given any
+camera — so the question was what that costs, and the answer is: three vector
+normalisations per frame, and nothing per ray.
+
+The basis is computed once into PL/pgSQL locals at the top of `render()` and
+passed to `cam_dir` as parameters. Those arrive as `Param` nodes, which cost
+nothing to inline over, so `cam_dir` and everything under it still collapses
+into the ray query — the plan is arithmetic over literals and `Var`s with no
+function call left in it. The literals are simply the *frame's* basis rather
+than a compile-time constant.
+
+This is the general shape of the repair, and the third time it has been the
+answer: bind the expensive operand to a local, let it arrive as a `Param`. The
+first two were `v3_refract`'s `sqrt` term and `quantize`'s exposed radiance.
+
 Inlining leaves no trace in the *shape* of a plan, but it does leave one in the
 expressions — a function that folded into its caller stops appearing by name in
 the `Output` line. That is what those tests assert.
