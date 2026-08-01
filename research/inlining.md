@@ -131,9 +131,45 @@ failure: a `vec3` operator handed an operand past the threshold.
 Of the 17 305 that remain, 96% are **aggregate transition functions** —
 `cand_min` under `nearest`, `v3_add` under `sum(vec3)`. An aggregate's
 transition function is invoked through `fmgr` on every row and can never be
-inlined, so this is a floor rather than a leak. Replacing `sum(vec3)` with
-three built-in `sum(float8)` calls would remove about 9 900 of them; that is
-measured as available, not as taken.
+inlined, so this is a floor rather than a leak.
+
+### Lowering the floor: the vec3 sum is worth 1.4x where it runs
+
+About 9 900 of those calls were `v3_add` under `sum(vec3)`, at the two places
+the renderer reduces vectors per row: the `rt_rad` collapse and the final
+shading aggregate. Summing the three components with the built-in
+`sum(float8)` and rebuilding the vector moves that arithmetic into C. Measured
+at 240x160, 2x2 samples, depth 5, interleaved, three reps each:
+
+| phase | `sum(vec3)` | three `sum(float8)` | |
+|---|---|---|---|
+| direct lighting | 709 / 698 / 697 ms | 510 / 513 / 514 ms | **1.37x** |
+| shading | 1584 / 1577 / 1594 ms | 1137 / 1089 / 1111 ms | **1.43x** |
+| whole frame | 15.1 / 14.4 / 14.8 s | 14.1 / 14.5 / 14.4 s | ~1.03x |
+
+661 ms off a 14.8 s frame, so **4.5%** — and the frame-level column shows why
+the phase timers are the honest measurement here: the run-to-run spread is
+about the size of the effect, and one of the three pairs is a dead tie.
+
+Output is bit-identical, on the default scene and on the dispersion-heavy torus
+scene, at the settings each is normally rendered. That is not luck: `sum(float8)`
+is strict with no initial condition, so its state starts at the first value
+rather than at `0 + x`, and `0 + x = x` exactly in IEEE-754.
+
+Two things worth carrying:
+
+- **`shade()` has to be bound once**, in a `LATERAL ... OFFSET 0`. Named three
+  times inside the three sums it is *called* three times per row, which costs
+  far more than the aggregate ever did. The change only pays because the
+  component split happens below the function call, not above it.
+- **`cand_min` under `nearest` is the other 6 700 and has no such fix.** It is
+  an argmin, not a sum, so there is no built-in to fall back to; C is out
+  without extensions and PL/pgSQL would be slower. The one trick available is
+  to make it sortable by a built-in — pack `(t, tri_id)` into a `bytea` as
+  `float8send(t) || int4send(tri_id)` and take `min()`, since big-endian
+  IEEE-754 compares correctly bytewise for non-negative values — but that
+  trades a legible custom aggregate for a per-row palloc and a concatenation.
+  Recorded as unmeasured and believed to be a dead end.
 
 ### Two things the audit taught
 

@@ -174,7 +174,16 @@ CREATE FUNCTION v3_maxc(a vec3) RETURNS float8
   AS $$ SELECT greatest(a.x, a.y, a.z) $$
   LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
--- Summing radiance contributions per pixel needs an aggregate over vec3.
+-- Averaging vectors -- vertex normals over the faces meeting a point, sky
+-- contributions over the light table -- wants an aggregate over vec3.
+--
+-- Not on any per-ray path, though.  A transition function is reached through
+-- fmgr on every row and so can never be inlined, which makes this the one
+-- construct here that cannot be optimised into arithmetic: it is a real call
+-- per row where the built-in sum(float8) is C.  The renderer therefore sums
+-- components and rebuilds the vector, and measured 1.4x on both phases that
+-- do it.  Reach for this where the row count is bounded by the scene rather
+-- than by the image.
 CREATE AGGREGATE sum(vec3) (
   SFUNC = v3_add,
   STYPE = vec3,
