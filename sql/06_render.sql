@@ -85,6 +85,38 @@ END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 -- bounce loop below is the recursion, unrolled by one level so that the work
 -- inside it can be expressed as an ordinary aggregating join.  The loop runs
 -- at most maxdepth+1 times and exits early when no rays survive.
+--
+-- The scratch tables are TEMP, and that is the one decision here that is about
+-- running several renders rather than about running one.
+--
+-- They were ordinary unlogged tables in public, with fixed names, which made
+-- them process-wide state in a design that has none anywhere else.  The
+-- failure that caused was quiet: two sessions rendering at once neither
+-- collided nor raised anything, the second just waited out the first's
+-- ACCESS EXCLUSIVE lock on `rt_hit`, and the pair took as long as running them
+-- in turn.  A temporary table is private to its session and reaped when the
+-- session ends, so the collision cannot arise and nothing has to be cleaned up
+-- afterwards.
+--
+-- The price is exact and it is the whole of it: **PostgreSQL cannot
+-- parallelise a query that reads a temporary table**, so a render is now
+-- single-threaded.  That sounds worse than it measured -- 8.7 s against 7.9 s
+-- at 160x120, 33 s against 30 s at 320x240, a steady 9% -- and the reason it
+-- is only 9% is worth keeping: writes are never parallel in PostgreSQL, so of
+-- this function's phases only the CREATE TABLE AS ray builds could ever get a
+-- Gather at all.  Every INSERT was already single-threaded.  Nine percent for
+-- four workers, against 3.5x for running eight renders at once, is not a close
+-- trade.
+--
+-- The alternative that avoids the trade is a schema per backend PID on the
+-- search_path, keeping unlogged tables and their workers.  It was built and
+-- measured before this and it is not worth it: it needs a garbage collector
+-- for the schemas that sessions leave behind, and the collector needs an
+-- elected sweeper, because DROP SCHEMA holds its lock until the transaction
+-- ends and a render is one transaction -- so two sessions sweeping the same
+-- corpses serialise exactly as badly as the bug being fixed.  About fifty
+-- lines of machinery, one self-inflicted deadlock-shaped bug, and a schema
+-- leaked per crashed session, to buy back nine percent.
 -- ---------------------------------------------------------------------------
 
 CREATE FUNCTION render(img_w int, img_h int, aa int DEFAULT 2, maxdepth int DEFAULT 5,
@@ -111,22 +143,15 @@ BEGIN
   cv  := cam_v(cw, cu);
   cth := tan(radians(p_fov) / 2.0);
 
-  DROP TABLE IF EXISTS img;
-  CREATE UNLOGGED TABLE img (x int, y int, r int, g int, b int);
-
-  DROP TABLE IF EXISTS rt_ray;
-  DROP TABLE IF EXISTS rt_new;
-  DROP TABLE IF EXISTS rt_hit;
-  DROP TABLE IF EXISTS rt_sray;
-  DROP TABLE IF EXISTS rt_shadow;
-  DROP TABLE IF EXISTS rt_rad;
-
-  -- The planner decides how many workers to give a scan from how many PAGES
-  -- it holds, which is exactly the wrong measure here: a ray table is small
-  -- but every row costs thousands of arithmetic operations in a function
-  -- call.  Left at the defaults the intersection is planned single-threaded.
-  SET LOCAL min_parallel_table_scan_size = 0;
-  SET LOCAL parallel_setup_cost = 100;
+  -- Every table here is TEMP, which is what lets two sessions render at once;
+  -- see the note above.  Only `img` can survive a previous call -- the scratch
+  -- tables are dropped at the end of a successful render and rolled away by a
+  -- failed one -- and it is cleared through the catalog rather than with DROP
+  -- TABLE IF EXISTS only to keep a NOTICE off every session's first render.
+  IF to_regclass('pg_temp.img') IS NOT NULL THEN
+    DROP TABLE img;
+  END IF;
+  CREATE TEMP TABLE img (x int, y int, r int, g int, b int);
 
   -- Flat float8 rather than the vec3 and hit records the shading functions
   -- take, because this is the one table that accumulates.  Every other scratch
@@ -147,7 +172,7 @@ BEGIN
   -- with the fields they belong to.  Left in reading order, `mat` sits between
   -- two float8 and every row pays four bytes of alignment padding to get back
   -- onto an eight-byte boundary: 167.8 bytes/row against 159.0 measured.
-  CREATE UNLOGGED TABLE rt_hit (
+  CREATE TEMP TABLE rt_hit (
     hid  bigserial,
     px   int,    py int,                    -- pixel this ray belongs to
     mat  int,    back boolean,              -- from the hit record; see below
@@ -157,12 +182,13 @@ BEGIN
     hx   float8, hy float8, hz float8,      -- point,
     nx   float8, ny float8, nz float8);     -- and shading normal
 
-  -- Every ray set is built with CREATE TABLE AS rather than INSERT INTO.
-  -- PostgreSQL refuses to parallelise any statement that writes, and CTAS is
-  -- the one exception: the identical query gets a Gather as a CTAS and none
-  -- at all as an INSERT ... SELECT.  Worth about 9% here -- the planner still
-  -- assigns only one worker, because it sizes workers by page count and a ray
-  -- table is small no matter how much arithmetic each row costs.
+  -- Every ray set is built with CREATE TABLE AS rather than INSERT INTO, which
+  -- was once worth about 9%: PostgreSQL refuses to parallelise any statement
+  -- that writes and CTAS is the one exception, so the identical query got a
+  -- Gather as a CTAS and none at all as an INSERT ... SELECT.  That is exactly
+  -- the 9% given up by making these tables temporary, and it is the same 9%
+  -- twice rather than a coincidence -- CTAS was the only phase that had it to
+  -- lose.  The form stays because it is the shorter way to write it.
   --
   -- A ray also carries its inverse direction as a real column.  Recomputing
   -- it in the query costs far more than storing it: the slab test mentions
@@ -175,7 +201,7 @@ BEGIN
   -- places the inlined slab and triangle tests name a ray component.  The
   -- inverse direction has no vector form at all -- nothing but box_hit ever
   -- reads it.
-  CREATE UNLOGGED TABLE rt_ray AS
+  CREATE TEMP TABLE rt_ray AS
   SELECT row_number() OVER () AS rid, gx.px, gy.py,
          p_from AS o, cr.dir AS d,
          (p_from).x AS ox, (p_from).y AS oy, (p_from).z AS oz,
@@ -200,7 +226,6 @@ BEGIN
        LATERAL (SELECT cam_dir(nd.nx, nd.ny, img_w::float8 / img_h,
                                cu, cv, cw, cth)
                 OFFSET 0) AS cr(dir);
-  ALTER TABLE rt_ray SET (parallel_workers = 4);
   ANALYZE rt_ray;
 
   FOR dep IN 0 .. maxdepth LOOP
@@ -210,8 +235,10 @@ BEGIN
     -- the mesh box rejects whole objects, the BVH leaf rejects clusters of
     -- triangles, the triangle's own box rejects the triangle, and only what
     -- survives all three reaches tri_hit.
-    DROP TABLE IF EXISTS rt_new;
-    CREATE UNLOGGED TABLE rt_new AS
+    IF dep > 0 THEN            -- nothing to clear on the first pass, and
+      DROP TABLE rt_new;       -- IF EXISTS would only be a NOTICE per render
+    END IF;
+    CREATE TEMP TABLE rt_new AS
     WITH best AS (
       SELECT r.rid, nearest(ROW(x.t, t.tri_id)::cand) AS c
       FROM rt_ray r
@@ -240,7 +267,6 @@ BEGIN
          LEFT JOIN material m ON m.mat_id = ms.mat_id
          CROSS JOIN LATERAL (
            SELECT make_hit(r.o, r.d, b.c, t, coalesce(m.mat_id, 0)) OFFSET 0) AS hh(h);
-    ALTER TABLE rt_new SET (parallel_workers = 4);
     ANALYZE rt_new;
 
     -- rt_new keeps its records: it is rebuilt every bounce, and child_ray
@@ -264,7 +290,7 @@ BEGIN
     -- Spawn the children of everything just hit.  Joining to material drops
     -- the sky rows, which spawn nothing.
     DROP TABLE rt_ray;
-    CREATE UNLOGGED TABLE rt_ray AS
+    CREATE TEMP TABLE rt_ray AS
     SELECT row_number() OVER () AS rid, s.px, s.py, s.o, s.d,
            (s.o).x AS ox, (s.o).y AS oy, (s.o).z AS oz,
            (s.d).x AS dx, (s.d).y AS dy, (s.d).z AS dz,
@@ -286,7 +312,6 @@ BEGIN
 
     GET DIAGNOSTICS live = ROW_COUNT;
     EXIT WHEN live = 0;
-    ALTER TABLE rt_ray SET (parallel_workers = 4);
     ANALYZE rt_ray;
   END LOOP;
 
@@ -295,7 +320,7 @@ BEGIN
   -- work from here down: a scene with three lights fires three shadow rays at
   -- an open floor and none at all at a wall facing away from all three.
   ts := clock_timestamp();
-  CREATE UNLOGGED TABLE rt_sray AS
+  CREATE TEMP TABLE rt_sray AS
   SELECT h.hid, l.light_id,
          h.hx + h.nx * 1e-3 AS ox,
          h.hy + h.ny * 1e-3 AS oy,
@@ -317,7 +342,6 @@ BEGIN
   WHERE wants_light(v3(h.dx, h.dy, h.dz),
                     hit_of(h.t, h.mat, h.hx, h.hy, h.hz,
                            h.nx, h.ny, h.nz, h.back), m, l);
-  ALTER TABLE rt_sray SET (parallel_workers = 4);
   ANALYZE rt_sray;
 
   -- Transmission toward the light, per blocking mesh.  An opaque mesh stops
@@ -325,7 +349,7 @@ BEGIN
   -- thickness actually traversed, which for a closed mesh is the span between
   -- the ray's first and last crossing of it.  Not a real caustic, but it
   -- keeps glass from casting the flat black hole a binary test would give it.
-  CREATE UNLOGGED TABLE rt_shadow AS
+  CREATE TEMP TABLE rt_shadow AS
   WITH blocker AS (
     SELECT s.hid, s.light_id, n.mesh_id, mm.kind, mm.absorb,
            min(x.t) AS t0, max(x.t) AS t1
@@ -378,7 +402,7 @@ BEGIN
   -- transition function is reached through fmgr on every row and can never be
   -- inlined, so sum(vec3) pays a call per row for what the built-in
   -- sum(float8) does in C.  Splitting it is worth 1.37x on this phase.
-  CREATE UNLOGGED TABLE rt_rad AS
+  CREATE TEMP TABLE rt_rad AS
   SELECT hid, ROW(sum((e).x), sum((e).y), sum((e).z))::vec3 AS rad
   FROM (
     SELECT s.hid,

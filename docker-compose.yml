@@ -10,8 +10,12 @@ services:
       - "5433:5432"
     # Parallel workers exchange tuples through /dev/shm, which Docker caps at
     # 64 MB by default.  A parallel Gather over a full-resolution ray set
-    # overruns that and the render dies with "could not resize shared memory
+    # overruns that and the query dies with "could not resize shared memory
     # segment ... No space left on device".
+    #
+    # The renderer no longer trips this -- its scratch tables are TEMP, and a
+    # query that reads one is never parallel -- but an ad-hoc query against the
+    # scene tables still can, and 1g costs nothing to leave in place.
     shm_size: 1g
     command:
       - postgres

@@ -151,3 +151,62 @@ Output is bit-identical on both example scenes, which the flat arithmetic has to
 be written deliberately to preserve: `v3_scale` multiplies by a reciprocal, so
 the shadow-ray direction is `v * (1.0 / dist)` and **not** `v / dist`. Those are
 different in floating point.
+
+## Several frames at once, and what a render gave up to allow it
+
+The scratch tables were unlogged tables in `public` with fixed names, so two
+sessions rendering at once did not collide and did not error — the second
+simply waited out the first's `ACCESS EXCLUSIVE` lock on `rt_hit`. Making them
+`TEMP` makes them private to the session and removes the collision entirely,
+and PostgreSQL reaps them when the session ends, so nothing has to be cleaned
+up.
+
+The cost is that **PostgreSQL will not parallelise a query that reads a
+temporary table**, so a render is now single-threaded. That is a real loss and
+it is a small one, measured back-to-back on the default scene:
+
+| | 160×120, 2×2, depth 4 | 320×240, 2×2, depth 5 |
+|---|---|---|
+| unlogged, four workers | 7.90 s | 30.4 s |
+| unlogged, `max_parallel_workers_per_gather = 0` | 8.71 s | 33.0 s |
+| **temp** | **8.57 s** | **32.8 s** |
+
+The temp row lands on the workers-off row, which is the check that the 9% gap
+is the workers and nothing else — `temp_buffers` at 512 MB instead of the 8 MB
+default moved it by 40 ms.
+
+**Nine percent is the whole of intra-render parallelism, and the reason is
+structural: writes are never parallel in PostgreSQL.** Of this renderer's
+phases only the `CREATE TABLE AS` ray builds could ever get a Gather; every
+`INSERT` was already single-threaded. The 9% here is the same 9% recorded
+under CTAS-against-INSERT, seen from the other side.
+
+Against that, running frames concurrently. Same scene, one 160×120 frame per
+session, wall clock for all of them:
+
+| sessions | wall clock | per frame | speedup |
+|---|---|---|---|
+| 1 | 8.76 s | 8.76 s | 1.0× |
+| 2 | 9.38 s | 4.69 s | 1.87× |
+| 4 | 11.68 s | 2.92 s | 3.00× |
+| 8 | 17.33 s | 2.17 s | 4.04× |
+
+### The design that keeps the workers is not worth it
+
+The alternative is a schema per backend PID put in front of `public` on the
+`search_path`: the scratch tables stay unlogged, keep their workers, and stop
+colliding because each session creates its own. It was built and measured
+before the temp version, and it is worth recording why it lost.
+
+A workspace named for a PID outlives the session that made it, so it needs a
+garbage collector — and the collector has to run somewhere, and the only
+somewhere is a render. That is where it falls apart. `DROP SCHEMA` takes an
+`AccessExclusiveLock` held until the transaction ends, and a render *is* one
+transaction, so two sessions starting together find the same dead workspaces,
+one takes the locks, and the other waits out an entire render before it can
+start its own. Measured: exactly the 2× serialisation the workspaces existed
+to remove, moved one level down and visible only in `pg_locks`.
+
+It is fixable — elect one sweeper with an advisory lock, add a `lock_timeout`
+so no sweep ever waits — and the fix works. It is about fifty lines, it leaks a
+schema per crashed session, and it buys nine percent.

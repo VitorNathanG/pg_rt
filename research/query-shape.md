@@ -59,18 +59,28 @@ crossing the diagonal ties exactly. Left unbroken, roughly 1% of the pixels of a
 TABLE AS` as the one exception.** The identical query gets a `Gather` as a CTAS
 and none at all as an `INSERT ... SELECT`. Worth about 9%.
 
-The planner still assigns only one worker, because it sizes workers by page
-count and a ray table is small no matter how much arithmetic each row costs.
-That is what `min_parallel_table_scan_size = 0` and `parallel_setup_cost = 100`
-in `render()` are for, alongside an explicit `parallel_workers = 4` on each ray
-table.
+The planner assigned only one worker to it, because it sizes workers by page
+count and a ray table is small no matter how much arithmetic each row costs, so
+each ray table carried `min_parallel_table_scan_size = 0`,
+`parallel_setup_cost = 100` and an explicit `parallel_workers = 4`.
 
-Parallel workers also need more shared memory than Docker's default 64 MB
-`/dev/shm`, which is why `docker-compose.yml` sets `shm_size`.
+**None of that is in the engine any more, and the reason is the more useful
+half of this finding.** The scratch tables are `TEMP` now, so that several
+frames can render at once, and a query that reads a temporary table is never
+parallel — so the 9% above is not a benefit the renderer collects, it is the
+exact price of concurrency, and `research/timings.md` prices it from the other
+direction and gets the same number.
 
-One related trap: **`PARALLEL SAFE` is not the default.** A single unmarked
-function anywhere in a query makes the whole query ineligible for parallel
-execution, silently.
+What is worth keeping is the shape of the rule rather than the tuning. Because
+writes are never parallel, CTAS was the *only* phase of this renderer that had
+parallelism to gain or lose in the first place; every `INSERT` was
+single-threaded throughout. A design whose phases are mostly writes has far
+less to gain from `max_parallel_workers` than its CPU count suggests, and that
+is worth knowing before tuning for it.
+
+One related trap, for the queries that can still parallelise: **`PARALLEL SAFE`
+is not the default.** A single unmarked function anywhere in a query makes the
+whole query ineligible for parallel execution, silently.
 
 ## JIT is off because it was measured
 

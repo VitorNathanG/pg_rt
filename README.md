@@ -241,11 +241,16 @@ obvious approach, which is why they are recorded rather than rediscovered:
 `render(..., p_verbose => true)` reports each phase as it goes, which is the
 quickest way to see where a particular scene is spending its time.
 
-Three settings are worth knowing about because they are not defaults: `jit` is
-**off** (it measured 3× slower here), every ray set is built with `CREATE TABLE
-AS` rather than `INSERT INTO` (PostgreSQL will not parallelise a writing
-statement, and CTAS is the one exception), and `docker-compose.yml` raises
-`shm_size` because parallel workers need more than Docker's default 64 MB.
+Two settings are worth knowing about because they are not defaults: `jit` is
+**off** (it measured 3× slower here), and `docker-compose.yml` raises `work_mem`
+because each bounce is one large set-oriented join.
+
+A single render is single-threaded, deliberately. The scratch tables are
+`TEMP`, which is what lets sessions render at once, and PostgreSQL will not
+parallelise a query that reads a temporary table. That costs 9%, because
+writes are never parallel in PostgreSQL and so only the `CREATE TABLE AS` ray
+builds ever had a Gather to lose — against 4× for running eight renders at
+once.
 
 ## Layout
 
