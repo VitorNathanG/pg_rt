@@ -149,10 +149,11 @@ copies of one OBJ at different sizes and angles, wearing different materials:
 ![torus](examples/torus.png)
 
 The same scene at 1920x1080 is
-[`examples/torus_fullhd.png`](examples/torus_fullhd.png). It is 604 kB, and it
-was 6.2 MB until the encoder could compress — the file in the repository is
-that same image put back through `inflate` and re-encoded, not re-rendered, so
-its pixels are the ones the tracer produced.
+[`examples/torus_fullhd.png`](examples/torus_fullhd.png), 604 kB where it was
+6.2 MB before the encoder could compress. That one is an **earlier** render,
+kept exactly as it was rather than re-traced: the file was read back in through
+this engine's own `inflate` and written out again, so its pixels are the ones
+the build of the day produced.
 
 The OBJ reader handles `v`, `vn` and `f`, polygons of any size
 (fan-triangulated), all of the `1`, `1/2`, `1//3` and `1/2/3` corner
