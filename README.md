@@ -21,7 +21,7 @@ triangle meshes, and the tracer does not know which is which.
 ```bash
 docker compose up -d      # PostgreSQL 17
 ./load.sh                 # install the engine and build the default scene
-./test.sh                 # 147 checks on the codec, the geometry and the optics
+./test.sh                 # 149 checks on the codec, the geometry and the optics
 ./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
 
@@ -335,7 +335,7 @@ once.
 | `sql/05_trace.sql` | Fresnel, absorption, direct lighting, ray spawning |
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
 | `sql/07_frame.sql` | the frame table, the render that stores its result, the queue |
-| `test/tests.sql` | 147 checks |
+| `test/tests.sql` | 149 checks |
 | `examples/` | a torus OBJ, the scene that loads it, a camera orbit, a moving scene |
 | [`research/`](research) | the measurements behind the design |
 

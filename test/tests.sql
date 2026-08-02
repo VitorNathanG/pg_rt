@@ -953,6 +953,43 @@ SELECT ok(plan_of('SELECT box_hit(t.ox,t.oy,t.oz,t.ivx,t.ivy,t.ivz,
 \echo
 \echo == end to end ==
 
+-- What the picture actually is.
+--
+-- Every other image assertion below is either a shape check or a comparison of
+-- two renders made by the same code, and none of them says what belongs at a
+-- given pixel.  The cost of that is exact and was measured rather than feared:
+-- swapping the arguments of cam_u's cross product mirrors the entire frame left
+-- to right, and the whole suite passes.  So does halving the exposure, and so
+-- does anything else that is wrong everywhere at once, because "wrong
+-- everywhere" is indistinguishable from "different" to a check that only
+-- compares one render against another.
+--
+-- The hash is over `img` rather than over the encoded PNG on purpose.  The
+-- encoder has its own section and its own vectors; folding it in here would
+-- mean every change to a Huffman tree or a filter heuristic arrives looking
+-- like a change to the renderer, which is the failure that makes golden tests
+-- get deleted.  This one moves when the image moves.
+--
+-- Reproducibility is not assumed: both values hold across sessions, at 64 kB
+-- work_mem, and with parallelism forced on.  They can be, because a render
+-- reads temporary tables and PostgreSQL will not parallelise that, so the
+-- order the per-pixel float8 sums accumulate in is fixed.
+SELECT render(48, 32, 1, 3);
+SELECT ok(md5(string_agg(r || ',' || g || ',' || b, ';' ORDER BY y, x))
+          = '3fb96cd9b0ec21bacfbb82bcaa9254af',
+          'a one-sample frame matches its recorded hash') FROM img;
+
+-- The second render is not a bigger copy of the first, and the divisor is why.
+-- `1/(aa*aa)` is the only place the sample count reaches shading, and at aa = 1
+-- it is 1 whichever way it is spelled -- so `1/aa` renders the hash above
+-- unchanged.  Measured: mutating it leaves the one-sample hash identical and
+-- this one different.  Every render in this file was aa = 1 before this line,
+-- which left the expression that turns samples into a pixel unwitnessed.
+SELECT render(48, 32, 2, 3);
+SELECT ok(md5(string_agg(r || ',' || g || ',' || b, ';' ORDER BY y, x))
+          = '67ed5e1af0feb021e4073790583cba56',
+          'a four-sample frame matches its recorded hash') FROM img;
+
 SELECT render(24, 16, 1, 3);
 SELECT ok(count(*) = 24 * 16, 'render fills every pixel exactly once') FROM img;
 SELECT ok(bool_and(r BETWEEN 0 AND 255 AND g BETWEEN 0 AND 255 AND b BETWEEN 0 AND 255),
