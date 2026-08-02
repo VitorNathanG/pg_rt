@@ -128,9 +128,21 @@ BEGIN
   -- Crown glass, with the dispersion exaggerated so it reads at this
   -- resolution: blue is bent harder than red, which is what splits white
   -- light into a spectrum at every non-normal incidence.
+  --
+  -- How exaggerated is worth writing down, because the number that matters is
+  -- not the index but the spread across the three channels.  At 0.060 this is
+  -- an Abbe number of 8.8, against 64 for the BK7 the material is named after
+  -- -- still seven times more dispersive than real glass, which is deliberate:
+  -- a real spread of 0.008 separates red from blue by a seventh of a degree
+  -- and does not survive being quantized to 8 bits.
+  --
+  -- It was 0.135, an Abbe number of 3.9, and that was too much -- the fringing
+  -- read as the material's defining feature rather than as an edge effect.
+  -- The green index is unchanged at 1.530, so the refraction itself is the
+  -- same shape it always was; only the width of the colour split moved.
   INSERT INTO material (name, kind, ior, absorb, spec_e, spec_k)
   VALUES ('crown-glass', mat_glass(),
-          ROW(1.470, 1.530, 1.605)::vec3, ROW(0.28, 0.14, 0.16)::vec3,
+          ROW(1.500, 1.530, 1.560)::vec3, ROW(0.28, 0.14, 0.16)::vec3,
           420.0, 1.6);
 
   PERFORM mesh_add_quad('ground', 'checker-tile', 40.0);

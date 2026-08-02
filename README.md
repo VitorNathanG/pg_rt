@@ -176,14 +176,21 @@ normals meeting each vertex, weighted by area.
 
 ### Dispersion
 
-A dielectric's index of refraction differs per channel (1.470 / 1.530 / 1.605
+A dielectric's index of refraction differs per channel (1.500 / 1.530 / 1.560
 for the default glass), so white light entering it splits. A ray carries a
 `chan` tag: `0` means it still stands for all three wavelengths, `1`–`3` mean
 it has been committed to one. At the first glass surface an undispersed ray
 spawns *three* refracted children, each masked down to its own channel and
 bent by its own index; from then on each follows a measurably different path.
-At 45° incidence red and blue separate by 2.6°, which is what puts the coloured
+At 45° incidence red and blue separate by 1.2°, which is what puts the coloured
 fringes along the glass edges.
+
+That separation is still about seven times what real crown glass does — an
+Abbe number of 8.8 against BK7's 64 — because a physical spread of 0.008 bends
+red and blue apart by a seventh of a degree and does not survive being
+quantized to 8 bits. Dispersion here is a demonstration that the channel tag
+works, deliberately turned up until it is visible, rather than a claim about
+glass.
 
 Shadow rays are attenuated rather than binary, so glass casts a tinted shadow
 whose colour comes from Beer–Lambert absorption over the thickness the ray

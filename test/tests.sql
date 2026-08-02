@@ -710,7 +710,14 @@ SELECT ok(bool_and(near(sin(radians(45.0))
 FROM generate_series(1,3) k;
 
 -- ...and the three channels must actually separate, or there is no dispersion.
-SELECT ok(red_out > green_out AND green_out > blue_out AND red_out - blue_out > 1.5,
+--
+-- The ordering is a property of any dielectric and holds whatever the indices
+-- are.  The one-degree floor is not: it is a claim about the *shipped* glass
+-- being dispersive enough to see, so it is deliberately coupled to
+-- sql/04_scene.sql and has to move when that material is retuned.  At the
+-- current spread of 0.060 this separation is 1.17 degrees; it was 2.61 before,
+-- and the threshold was 1.5, which is how this check announced the change.
+SELECT ok(red_out > green_out AND green_out > blue_out AND red_out - blue_out > 1.0,
           'red, green and blue refract to measurably different angles')
 FROM (SELECT degrees(acos(-v3_dot(v3_refract(v3_unit(v3(1,-1,0)), v3(0,1,0),
                                              1.0 / ior_of(m_glass(), k)), v3(0,1,0))))
@@ -976,7 +983,7 @@ SELECT ok(plan_of('SELECT box_hit(t.ox,t.oy,t.oz,t.ivx,t.ivy,t.ivz,
 -- order the per-pixel float8 sums accumulate in is fixed.
 SELECT render(48, 32, 1, 3);
 SELECT ok(md5(string_agg(r || ',' || g || ',' || b, ';' ORDER BY y, x))
-          = '3fb96cd9b0ec21bacfbb82bcaa9254af',
+          = '639c30aadec4eff915bfb48f62f38909',
           'a one-sample frame matches its recorded hash') FROM img;
 
 -- The second render is not a bigger copy of the first, and the divisor is why.
@@ -987,7 +994,7 @@ SELECT ok(md5(string_agg(r || ',' || g || ',' || b, ';' ORDER BY y, x))
 -- which left the expression that turns samples into a pixel unwitnessed.
 SELECT render(48, 32, 2, 3);
 SELECT ok(md5(string_agg(r || ',' || g || ',' || b, ';' ORDER BY y, x))
-          = '67ed5e1af0feb021e4073790583cba56',
+          = '287fdd3fdb6e14059d52826bd4966bf8',
           'a four-sample frame matches its recorded hash') FROM img;
 
 SELECT render(24, 16, 1, 3);
