@@ -280,6 +280,39 @@ SELECT ok(paeth(0, 100, 0) = 100, 'Paeth picks above');
 SELECT ok(paeth(100, 0, 50) = 50, 'Paeth picks upper-left');
 SELECT ok(paeth(7, 7, 7) = 7, 'Paeth on three equal neighbours is that value');
 
+\echo == png decoding ==
+
+-- Reading a PNG back exercises the three pieces that had never been run in
+-- this direction -- png_idat, zlib_inflate, png_unfilter -- and a mistake in
+-- any of them produces pixels rather than an error.  So the check is an
+-- identity against the table the PNG was made from, not a plausibility test.
+CREATE TEMP TABLE t_img AS
+SELECT x, y, (x * 7 + y * 3) % 256 AS r, (x * x + y) % 256 AS g,
+       (x + y * y * 5) % 256 AS b
+FROM generate_series(0, 23) AS gx(x), generate_series(0, 17) AS gy(y);
+
+SELECT ok(w = 24 AND h = 18, 'png_size reads the dimensions out of IHDR')
+FROM png_size(png_encode(24, 18, png_scanlines('t_img')));
+
+SELECT ok(length(png_raw(png_encode(24, 18, png_scanlines('t_img')))) = 24 * 18 * 3,
+          'png_raw returns three bytes a pixel');
+
+SELECT ok(count(*) = 0, 'a PNG decodes back to exactly the pixels it was made from')
+FROM png_pixels(png_encode(24, 18, png_scanlines('t_img'))) AS d
+     FULL JOIN t_img i ON i.x = d.x AND i.y = d.y
+WHERE d.r IS DISTINCT FROM i.r OR d.g IS DISTINCT FROM i.g
+   OR d.b IS DISTINCT FROM i.b;
+
+-- The same, through every filter, because the decoder undoes all five and only
+-- the one the encoder happened to choose is covered above.
+SELECT ok(bool_and(png_raw(png_encode(24, 18, png_scanlines('t_img', f)))
+                   = png_raw(png_encode(24, 18, png_scanlines('t_img', 0)))),
+          'all five scanline filters reconstruct the same pixels')
+FROM generate_series(0, 4) AS g(f);
+
+SELECT ok(raises($$SELECT png_size('\x00010203'::bytea)$$),
+          'something that is not a PNG is refused rather than decoded');
+
 \echo
 \echo == vector algebra ==
 

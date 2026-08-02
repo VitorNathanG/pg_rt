@@ -300,3 +300,76 @@ BEGIN
   END LOOP;
   RETURN acc;
 END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
+
+-- ---------------------------------------------------------------------------
+-- The dimensions, without decompressing anything.
+--
+-- IHDR is required to be the first chunk, so every field it holds sits at a
+-- fixed offset and 33 bytes are enough to answer the question.  Taking them
+-- with substring rather than reading the whole value matters: TOAST can slice
+-- a stored bytea without reassembling it, so this stays cheap on a frame that
+-- is half a megabyte on disk.
+--
+-- The three refusals are narrow on purpose.  This decoder exists to read back
+-- what png_encode wrote, and png_encode writes one thing: 8-bit truecolour,
+-- non-interlaced.  Accepting a palette or 16-bit PNG here would mean claiming
+-- to handle formats png_unfilter cannot, and the failure would surface as
+-- garbled pixels rather than an error.
+-- ---------------------------------------------------------------------------
+CREATE FUNCTION png_size(png bytea, OUT w int, OUT h int) AS $$
+DECLARE hdr bytea := substring(png FROM 1 FOR 33);
+BEGIN
+  IF substring(hdr FROM 1 FOR 8) <> '\x89504e470d0a1a0a'::bytea THEN
+    RAISE EXCEPTION 'not a PNG';
+  END IF;
+  IF substring(hdr FROM 13 FOR 4) <> convert_to('IHDR', 'SQL_ASCII') THEN
+    RAISE EXCEPTION 'first chunk is not IHDR';
+  END IF;
+  w := (get_byte(hdr, 16) << 24) | (get_byte(hdr, 17) << 16)
+     | (get_byte(hdr, 18) <<  8) |  get_byte(hdr, 19);
+  h := (get_byte(hdr, 20) << 24) | (get_byte(hdr, 21) << 16)
+     | (get_byte(hdr, 22) <<  8) |  get_byte(hdr, 23);
+  IF get_byte(hdr, 24) <> 8 OR get_byte(hdr, 25) <> 2 THEN
+    RAISE EXCEPTION 'PNG is depth % colour type %, expected 8-bit truecolour',
+                    get_byte(hdr, 24), get_byte(hdr, 25);
+  END IF;
+  IF get_byte(hdr, 28) <> 0 THEN
+    RAISE EXCEPTION 'PNG is interlaced';
+  END IF;
+END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
+
+-- The pixels of a PNG as raw RGB, three bytes each, row by row.
+--
+-- Every step of this existed already and none of them had ever been run in
+-- this direction: png_idat joins the chunks, zlib_inflate undoes the
+-- compression, png_unfilter undoes the prediction.  Inflate was written for
+-- symmetry and had no caller until an animation needed the pixels of a frame
+-- that had already been encoded.
+CREATE FUNCTION png_raw(png bytea) RETURNS bytea AS $$
+DECLARE sz record;
+BEGIN
+  SELECT * INTO sz FROM png_size(png);
+  RETURN png_unfilter(zlib_inflate(png_idat(png)), sz.w, sz.h);
+END $$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+-- The same, as rows shaped like `img` -- so anything that consumes a rendered
+-- image consumes a decoded one without knowing the difference.
+--
+-- `raw` is a local rather than an expression in the query for the reason
+-- 02_deflate.sql opens with: a bytea this size read a byte at a time is
+-- quadratic if each read has to resolve a pointer.  png_unfilter hands back a
+-- value that was built in memory, and passing that down as a Param keeps every
+-- get_byte below O(1).
+CREATE FUNCTION png_pixels(png bytea)
+RETURNS TABLE (x int, y int, r int, g int, b int) AS $$
+DECLARE
+  sz  record;
+  raw bytea;
+BEGIN
+  SELECT * INTO sz FROM png_size(png);
+  raw := png_raw(png);
+  RETURN QUERY
+  SELECT (i % sz.w)::int, (i / sz.w)::int,
+         get_byte(raw, i * 3), get_byte(raw, i * 3 + 1), get_byte(raw, i * 3 + 2)
+  FROM generate_series(0, sz.w * sz.h - 1) AS g(i);
+END $$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
