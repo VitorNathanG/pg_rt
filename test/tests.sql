@@ -1243,6 +1243,23 @@ SELECT ok((SELECT png FROM frame WHERE name = 't_frame')
 SELECT ok(raises($$SELECT render_frame('no-such-frame')$$),
           'rendering a frame that does not exist is an error');
 
+-- A refinement threshold is a setting of the view like the rest, so a frame
+-- carrying one must produce what the same request produces by argument.  The
+-- pair also pins the column against the argument order in render(): a refine
+-- silently dropped on the way through leaves a frame that renders uniformly
+-- and looks perfectly correct on its own.
+INSERT INTO frame (name, w, h, aa, maxdepth, refine)
+VALUES ('t_frame3', 48, 32, 2, 3, 16);
+SELECT render_frame('t_frame3');
+SELECT ok((SELECT png FROM frame WHERE name = 't_frame3')
+          = render_png(48, 32, 2, 3, 1.35, cam_from(), cam_at(), cam_fov(), 16)
+      AND (SELECT png FROM frame WHERE name = 't_frame3')
+          <> render_png(48, 32, 2, 3, 1.35),
+          'a frame that asks to be refined is refined, and differs from one that does not');
+
+SELECT ok(raises($$INSERT INTO frame (name, w, h, refine) VALUES ('neg', 8, 8, -1)$$),
+          'a frame with a negative refinement threshold is refused');
+
 DELETE FROM frame WHERE name LIKE 't_frame%';
 
 

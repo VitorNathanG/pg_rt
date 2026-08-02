@@ -30,6 +30,12 @@ CREATE TABLE frame (
   exposure    float8 NOT NULL DEFAULT 1.35,
   cutoff      float8 NOT NULL DEFAULT 0.01,
 
+  -- Nullable because null is the setting, not a missing one: no refinement
+  -- pass at all, `aa` everywhere.  A number is how many 8-bit levels two
+  -- neighbouring pixels may differ by before the finer grid is spent on them,
+  -- so it shares a scale with the image rather than with the sampler.
+  refine      int,
+
   -- The camera lives on the frame, not on the geometry.  A camera is a
   -- property of a view of a scene rather than of the scene, which is what
   -- makes a hundred viewpoints a hundred rows instead of a hundred databases.
@@ -42,6 +48,7 @@ CREATE TABLE frame (
   png         bytea,
 
   CHECK (w > 0 AND h > 0 AND aa > 0 AND maxdepth >= 0),
+  CHECK (refine IS NULL OR refine >= 0),
   CHECK (cam_fov > 0.0 AND cam_fov < 180.0),
   CHECK ((cam_from).x <> (cam_at).x OR (cam_from).y <> (cam_at).y
       OR (cam_from).z <> (cam_at).z)
@@ -75,7 +82,7 @@ BEGIN
   END IF;
 
   PERFORM render(f.w, f.h, f.aa, f.maxdepth, f.exposure, f.cutoff, p_verbose,
-                 f.cam_from, f.cam_at, f.cam_fov);
+                 f.cam_from, f.cam_at, f.cam_fov, f.refine);
 
   UPDATE frame
      SET png         = png_encode(f.w, f.h, png_scanlines('img')),
