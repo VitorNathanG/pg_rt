@@ -1,14 +1,16 @@
 # pg_rt — a raytracer in PostgreSQL 17
 
-A recursive raytracer that runs entirely inside PostgreSQL and returns a PNG as
-a `bytea`. It renders arbitrary triangular meshes with selectable materials.
-No extensions, no procedural language beyond the two that ship in core, no
-external image library — the PNG container, its checksums, its scanline filters
-and a complete DEFLATE codec in both directions are all built in SQL.
+A recursive raytracer that runs entirely inside PostgreSQL and returns a PNG or
+a GIF as a `bytea`. It renders arbitrary triangular meshes with selectable
+materials. No extensions, no procedural language beyond the two that ship in
+core, no external image library — both containers, their checksums, the PNG
+scanline filters, a complete DEFLATE codec in both directions, a 256-colour
+quantiser and LZW are all built in SQL.
 
 ```sql
 SELECT render(600, 400, 2, 5);                       -- trace into the table `img`
 SELECT png_encode(600, 400, png_scanlines('img'));   -- -> bytea
+SELECT gif_of('img');                                -- -> bytea, half the size
 ```
 
 ![torus](examples/torus_fullhd.png)
@@ -28,9 +30,12 @@ whose neighbours disagreed with them, which were traced again at four. That is
 ```bash
 docker compose up -d      # PostgreSQL 17
 ./load.sh                 # install the engine and build the default scene
-./test.sh                 # 156 checks on the codec, the geometry and the optics
+./test.sh                 # 180 checks on the codecs, the geometry and the optics
 ./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
+
+`render.sh` picks the encoder from the name you give it, so
+`./render.sh 600 400 2 5 1.35 out.gif` writes a GIF instead.
 
 That last line produces the default scene, which is what `load.sh` builds and
 what every test in the suite is written against:
@@ -345,6 +350,40 @@ The codec is verified against streams a real zlib produced, in both directions,
 because a compressor and a decompressor that share an author will happily agree
 on the same mistake.
 
+### The GIF is mostly a quantiser
+
+A GIF pixel is one byte where a PNG pixel is three, and everything follows from
+that. The same 480×320 frame is **41 kB against 80 kB**, and it encodes in 1.7 s
+against 2.8 s — LZW is a weaker compressor than DEFLATE and it is handed a third
+as much input, so it wins on both counts. What is given up is every colour past
+the 256th, which here costs a mean of 1.3 levels a pixel.
+
+Getting to one byte a pixel is the work, and it is three joins:
+
+* **The palette is a table.** Median cut splits a whole round of boxes per
+  query rather than one box per iteration, so choosing 256 colours is nine
+  window queries rather than 255 sequential scans over the colour set.
+* **Mapping a colour to an entry is a join**, not a search. The nearest entry is
+  found once per distinct colour and kept, so every pixel wearing that colour —
+  in this frame or a later one — is a hash probe.
+* **The dither matrix is 64 rows.** It is off by default, which is a
+  measurement rather than a preference: a palette fitted to a render is *finer
+  than the render*, so at 256 colours dithering makes the picture measurably
+  worse and the file 17% bigger. Below 64 colours that reverses completely.
+
+Both palette constructions were replaced after being measured, and both had
+failed invisibly — the first wasted 49 of its 256 entries on colours it could
+not split, the second picked the wrong entry for 49% of the frame's colours.
+[`research/gif.md`](research/gif.md) has both, and the reason the second one is
+a mistake you only make when the palette is fitted to a picture rather than to
+the colour cube.
+
+LZW is a loop and cannot be otherwise, for the same reason `inflate` is. It has
+a decoder beside it for the same reason too: the one thing in the format that
+has to be exactly right is *when the code width grows*, encoder and decoder
+never hold the same dictionary at the same moment, and an off-by-one there
+produces a file that decodes into plausible rubbish rather than failing.
+
 ## Performance
 
 A 240×160 frame with 2×2 samples and depth 5 renders the default 1118-triangle
@@ -362,6 +401,7 @@ obvious approach, which is why they are recorded rather than rediscovered:
 | [`research/deflate.md`](research/deflate.md) | Where the bytes live, why the block chooser has to cost the whole block, and what the filters are worth |
 | [`research/timings.md`](research/timings.md) | Per-phase and per-resolution breakdowns, and what a full HD frame costs in bytes |
 | [`research/sampling.md`](research/sampling.md) | Adaptive antialiasing, and why selecting the edges selects the expensive rays |
+| [`research/gif.md`](research/gif.md) | The quantiser: a palette that wasted a fifth of itself, and a lookup that was wrong half the time |
 
 `render(..., p_verbose => true)` reports each phase as it goes, which is the
 quickest way to see where a particular scene is spending its time.
@@ -383,13 +423,14 @@ once.
 |---|---|
 | `sql/01_vec3.sql` | `vec3` type, operators, reflection and Snell refraction |
 | `sql/02_deflate.sql` | Adler-32, LZ77, Huffman, DEFLATE and INFLATE |
-| `sql/02_png.sql` | CRC-32, the five scanline filters, PNG chunk framing |
+| `sql/02_gif.sql` | median-cut quantiser, ordered dither, LZW both ways, GIF framing |
+| `sql/02_png.sql` | CRC-32, the five scanline filters, PNG chunk framing, PNG decoding |
 | `sql/03_mesh.sql` | mesh/material/triangle tables, transforms, intersection, BVH, OBJ loader |
 | `sql/04_scene.sql` | the light table, sky, the default scene |
 | `sql/05_trace.sql` | Fresnel, absorption, direct lighting, ray spawning |
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
 | `sql/07_frame.sql` | the frame table, the render that stores its result, the queue |
-| `test/tests.sql` | 156 checks |
+| `test/tests.sql` | 180 checks |
 | `examples/` | a torus OBJ, the scene that loads it, a camera orbit, a moving scene |
 | [`research/`](research) | the measurements behind the design |
 

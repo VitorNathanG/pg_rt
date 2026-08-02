@@ -701,3 +701,23 @@ RETURNS bytea AS $$
                 p_refine);
   SELECT png_encode(w, h, png_scanlines('img'));
 $$ LANGUAGE sql;
+
+-- The same, as a GIF.  Worth having for one image and not only for a sequence:
+-- a GIF pixel is one byte where a PNG pixel is three, which makes it both the
+-- smaller file and the quicker encode -- 41 kB in 1.7 s against 80 kB in 2.8 s
+-- at 480x320 -- so this is the fast way to look at a render.  What it costs is
+-- every colour past the 256th, which measures a mean of 1.3 levels a pixel on
+-- this scene; see 02_gif.sql and research/gif.md.
+CREATE FUNCTION render_gif(w int DEFAULT 480, h int DEFAULT 320, aa int DEFAULT 2,
+                           maxdepth int DEFAULT 6, exposure float8 DEFAULT 1.35,
+                           p_from vec3 DEFAULT cam_from(),
+                           p_at vec3 DEFAULT cam_at(),
+                           p_fov float8 DEFAULT cam_fov(),
+                           p_refine int DEFAULT NULL,
+                           p_colors int DEFAULT 256,
+                           p_dither float8 DEFAULT 0.0)
+RETURNS bytea AS $$
+  SELECT render(w, h, aa, maxdepth, exposure, 0.01, false, p_from, p_at, p_fov,
+                p_refine);
+  SELECT gif_of('img', p_colors, p_dither);
+$$ LANGUAGE sql;

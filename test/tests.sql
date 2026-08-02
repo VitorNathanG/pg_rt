@@ -314,6 +314,143 @@ SELECT ok(raises($$SELECT png_size('\x00010203'::bytea)$$),
           'something that is not a PNG is refused rather than decoded');
 
 \echo
+\echo == gif ==
+
+-- ## The codec
+--
+-- A hand-derived vector, because a round trip only proves the two halves agree
+-- with each other.  Six copies of byte 1 at a minimum code size of 2 emit the
+-- codes 4 (clear), 1, 6, 7, 5 (end), all three bits wide, packed
+-- least-significant-bit first: 0x8c 0x5f.
+SELECT ok(gif_lzw('\x010101010101'::bytea, 2) = '\x8c5f'::bytea,
+          'LZW emits the bytes worked out by hand from the format');
+
+-- Round trips at every legal code size and past the point where the dictionary
+-- fills and has to be cleared.  Code-width growth is the mistake this catches:
+-- an encoder that widens one code early or late produces a stream that decodes
+-- into plausible rubbish rather than failing.
+SELECT ok(bool_and(gif_unlzw(gif_lzw(b, mc), mc) = b),
+          'LZW round trips at every minimum code size')
+FROM generate_series(2, 8) AS m(mc),
+     LATERAL (SELECT decode(string_agg(lpad(to_hex(i % (1 << mc)), 2, '0'), ''), 'hex')
+              FROM generate_series(1, 9000) AS g(i)) AS q(b);
+
+-- Long, and deliberately incompressible: a stream with no repeated pairs
+-- invents a dictionary entry per byte, so this fills all 4096 and clears them
+-- dozens of times.  It is also the case where LZW comes out larger than it went
+-- in, which is legal and worth having pass through unharmed.
+SELECT ok(gif_unlzw(gif_lzw(b, 8), 8) = b AND length(gif_lzw(b, 8)) > length(b),
+          'LZW round trips input long enough to fill and reset the dictionary')
+FROM (SELECT decode(string_agg(md5(g::text), ''), 'hex')
+      FROM generate_series(1, 7500) AS g) AS q(b);
+
+SELECT ok(gif_unlzw(gif_lzw(''::bytea, 8), 8) = ''::bytea,
+          'an empty image is a clear and an end code');
+
+SELECT ok(raises($$SELECT gif_lzw('\x00'::bytea, 1)$$),
+          'a minimum code size below 2 is refused');
+
+-- Sub-blocks: runs of 255 with their own length byte, and a zero to finish.
+SELECT ok(length(gif_blocks(b)) = 604
+      AND get_byte(gif_blocks(b), 0)   = 255
+      AND get_byte(gif_blocks(b), 256) = 255
+      AND get_byte(gif_blocks(b), 512) = 90
+      AND get_byte(gif_blocks(b), 603) = 0,
+          'sub-block framing splits at 255 and terminates')
+FROM (SELECT decode(repeat('aa', 600), 'hex')) AS q(b);
+
+SELECT ok(gif_blocks(''::bytea) = '\x00'::bytea,
+          'no data is still a terminator');
+
+-- ## The quantiser
+--
+-- An image with few enough colours to fit the palette must come back exactly.
+-- This is the check that the whole chain -- histogram, median cut, weighted
+-- means, nearest-entry lookup -- is lossless when it has no reason not to be,
+-- and it is worth more than a tolerance because the failure modes here (a
+-- dropped box, a wrong mean, an off-by-one index) all survive a tolerance.
+CREATE TEMP TABLE t_four AS
+SELECT x, y,
+       CASE WHEN x < 8 AND y < 8 THEN 255 WHEN x < 8 THEN 0
+            WHEN y < 8 THEN 17 ELSE 200 END AS r,
+       CASE WHEN x < 8 AND y < 8 THEN 0   WHEN x < 8 THEN 128
+            WHEN y < 8 THEN 240 ELSE 200 END AS g,
+       CASE WHEN x < 8 AND y < 8 THEN 0   WHEN x < 8 THEN 64
+            WHEN y < 8 THEN 9 ELSE 200 END AS b
+FROM generate_series(0, 15) AS gx(x), generate_series(0, 15) AS gy(y);
+
+SELECT gif_hist_reset();
+SELECT gif_hist_add('t_four');
+SELECT ok((SELECT count(*) FROM gif_hist) = 4
+      AND (SELECT sum(n) FROM gif_hist) = 256,
+          'the histogram is one row a colour and accounts for every pixel');
+
+SELECT ok(gif_palette(256) = 4,
+          'a four-colour image needs four palette entries, not 256');
+
+SELECT ok(count(*) = 4, 'and they are that image''s colours, exactly')
+FROM gif_pal p JOIN (SELECT DISTINCT r, g, b FROM t_four) s
+  ON s.r = p.r AND s.g = p.g AND s.b = p.b;
+
+SELECT ok(bool_and(p.r = t.r AND p.g = t.g AND p.b = t.b) AND count(*) = 256,
+          'with no dither every pixel maps back to its own colour')
+FROM (SELECT gs AS k, get_byte(gif_indices('t_four', 0.0), gs) AS i
+      FROM generate_series(0, 255) AS gs) AS ix
+     JOIN gif_pal p ON p.i = ix.i
+     JOIN t_four t ON t.x = ix.k % 16 AND t.y = ix.k / 16;
+
+-- A colour table is a power of two long, so asking for a size that is not one
+-- has to mean something definite rather than being rejected or rounded twice.
+SELECT ok(gif_palette(100) <= 64, 'a palette size rounds down to a power of two');
+
+-- The histogram is what makes one palette serve a whole animation, so adding a
+-- second image has to accumulate rather than replace.
+SELECT gif_hist_add('t_img');
+SELECT ok((SELECT sum(n) FROM gif_hist) = 256 + 24 * 18,
+          'a second image folds into the histogram rather than replacing it');
+
+-- ## The container
+--
+-- The header is fixed-width up to the first sub-block, so its length is
+-- arithmetic: 6 signature + 7 screen descriptor + 3 * 4 colour table
+-- + 8 graphic control + 10 image descriptor + 1 code size.  Checking the
+-- offset pins the layout; decoding from it proves the pixels survived.
+SELECT gif_hist_reset();
+SELECT gif_hist_add('t_four');
+SELECT gif_palette(4);
+
+CREATE TEMP TABLE t_gif AS SELECT gif_of('t_four', 4, 0.0) AS g;
+
+SELECT ok(substring(g from 1 for 6) = convert_to('GIF89a', 'SQL_ASCII')
+      AND substring(g from length(g) for 1) = '\x3b'::bytea
+      AND get_byte(g, 10) = 241            -- global table, 8-bit source, 4 entries
+      AND get_byte(g, 6) = 16 AND get_byte(g, 8) = 16,
+          'the header says GIF89a, 16x16, four colours, and the file ends')
+FROM t_gif;
+
+SELECT ok(gif_unlzw(substring(g from 46 for get_byte(g, 44)), 2)
+          = gif_indices('t_four', 0.0),
+          'the image data decodes back to the indices that went in')
+FROM t_gif;
+
+-- A single image has nothing to loop, so the Netscape block is only written
+-- when there is more than one frame to loop over.
+SELECT ok(position(convert_to('NETSCAPE2.0', 'SQL_ASCII') in g) = 0,
+          'a one-frame GIF carries no loop extension')
+FROM t_gif;
+
+SELECT ok(position(convert_to('NETSCAPE2.0', 'SQL_ASCII') in
+                   gif_encode(16, 16, ARRAY[gif_image(gif_indices('t_four', 0.0)),
+                                            gif_image(gif_indices('t_four', 0.0))],
+                              ARRAY[7, 7])) > 0,
+          'a two-frame GIF carries one');
+
+SELECT ok(raises($$SELECT gif_encode(16, 16, ARRAY[]::bytea[])$$),
+          'a GIF with no images is refused');
+
+DROP TABLE t_gif, t_four, t_img;
+
+\echo
 \echo == vector algebra ==
 
 SELECT ok(near(v3_dot(v3(1,2,3), v3(4,-5,6)), 12), 'dot product');
