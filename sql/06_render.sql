@@ -217,18 +217,40 @@ BEGIN
   -- places the inlined slab and triangle tests name a ray component.  The
   -- inverse direction has no vector form at all -- nothing but box_hit ever
   -- reads it.
+  -- Which pixels to sample and how finely, as rows.
+  --
+  -- This used to be the cross join below: every pixel, at one fixed rate, with
+  -- the rate arriving as a PL/pgSQL Param.  Written that way the sampling
+  -- pattern is a property of the query text, so there is nowhere to say "this
+  -- pixel and not that one" without writing a second query that repeats the
+  -- camera.  As a table it is a WHERE clause, and the ray builder below stops
+  -- caring where the work came from.
+  --
+  -- `side` is the grid side rather than the sample count, because that is what
+  -- the sample positions are computed from; a pixel gets side*side rays.
+  --
+  -- Reading the rate from a column instead of a Param costs 32 ms of a 413 ms
+  -- ray build at 400x260, and nothing anywhere else -- the camera still folds
+  -- to arithmetic over literals, checked in the plan.  That is 0.3% of a frame,
+  -- which is below the run-to-run spread of the whole render and had to be
+  -- timed as its own phase to be seen at all.
+  CREATE TEMP TABLE rt_todo AS
+  SELECT gx.px, gy.py, aa AS side
+  FROM generate_series(0, img_w - 1) AS gx(px),
+       generate_series(0, img_h - 1) AS gy(py);
+  ANALYZE rt_todo;
+
   CREATE TEMP TABLE rt_ray AS
-  SELECT row_number() OVER () AS rid, gx.px, gy.py,
+  SELECT row_number() OVER () AS rid, td.px, td.py,
          p_from AS o, cr.dir AS d,
          (p_from).x AS ox, (p_from).y AS oy, (p_from).z AS oz,
          (cr.dir).x AS dx, (cr.dir).y AS dy, (cr.dir).z AS dz,
          (v3_inv(cr.dir)).x AS ivx, (v3_inv(cr.dir)).y AS ivy,
          (v3_inv(cr.dir)).z AS ivz,
          ROW(1,1,1)::vec3 AS att, 0 AS chan
-  FROM generate_series(0, img_w - 1) AS gx(px),
-       generate_series(0, img_h - 1) AS gy(py),
-       generate_series(0, aa - 1) AS sx(i),
-       generate_series(0, aa - 1) AS sy(j),
+  FROM rt_todo td,
+       generate_series(0, td.side - 1) AS sx(i),
+       generate_series(0, td.side - 1) AS sy(j),
        -- The device coordinates are materialised before cam_dir sees them,
        -- and that is load-bearing rather than tidy.  cam_dir's body reaches
        -- v3_unit, which names each component three times; spelled inline
@@ -236,8 +258,8 @@ BEGIN
        -- PostgreSQL will inline, and the camera ray costs a whole executor
        -- run per sample.  As Vars they cost nothing to duplicate and the
        -- entire camera folds to arithmetic over literals.
-       LATERAL (SELECT 2.0 * ((gx.px + (sx.i + 0.5) / aa) / img_w) - 1.0,
-                       1.0 - 2.0 * ((gy.py + (sy.j + 0.5) / aa) / img_h)
+       LATERAL (SELECT 2.0 * ((td.px + (sx.i + 0.5) / td.side) / img_w) - 1.0,
+                       1.0 - 2.0 * ((td.py + (sy.j + 0.5) / td.side) / img_h)
                 OFFSET 0) AS nd(nx, ny),
        LATERAL (SELECT cam_dir(nd.nx, nd.ny, img_w::float8 / img_h,
                                cu, cv, cw, cth)
@@ -580,7 +602,8 @@ BEGIN
       round(extract(epoch FROM clock_timestamp() - ts)::numeric * 1000);
   END IF;
 
-  DROP TABLE rt_ray, rt_new, rt_hit, rt_sray, rt_shadow, rt_rad, rt_spp, img_acc;
+  DROP TABLE rt_ray, rt_new, rt_hit, rt_sray, rt_shadow, rt_rad,
+             rt_todo, rt_spp, img_acc;
 END $$ LANGUAGE plpgsql;
 
 -- Convenience wrapper: render and hand back the encoded PNG in one call.
