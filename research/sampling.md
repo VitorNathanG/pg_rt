@@ -82,10 +82,26 @@ silhouette, its caustic, the chromatic fringing that dispersion produces. So
 the contrast test, doing exactly its job, selects the pixels whose ray trees
 branch hardest.
 
-This is not a quirk of one scene. Contrast selects edges and specular
-structure; edges and specular structure are where transport gets deep. Any
-renderer with branching materials should expect the same gap between the pixel
-fraction and the cost fraction.
+The mechanism generalises. **The constant does not**, and the torus scene is
+the proof — two rings, one of them glass, at 1920×1080:
+
+| | primary rays | total hits | time |
+|---|---|---|---|
+| pass 1 (2 073 600 px, 1 sample) | 2 073 600 | 7 238 293 | 279 s |
+| pass 2 (217 694 px, 2×2) | 870 776 | 8 064 081 | 455 s |
+
+Pass 2 fired **42%** of pass 1's rays and did more total work than the whole
+first pass. The refined 10.5% of the image is almost entirely glass — the
+silhouettes, the dispersion fringing, the caustics on the floor — so the same
+selection that costs 2.15× its share on the default scene costs **4.7×** here,
+and the saving falls from a predicted 53% to a measured 24%.
+
+So the model below is a way of thinking about the cost, not a number to quote
+at a new scene. What carries is the shape: contrast selects edges and specular
+structure, edges and specular structure are where transport gets deep, and the
+more a scene is made of glass the worse the trade gets. A scene of diffuse
+surfaces would refine at close to its pixel fraction; this one refines at four
+and a half times it.
 
 ## What it actually costs
 
@@ -132,19 +148,21 @@ should. And the saving follows it, measured back-to-back at each size:
 | 800×520 | 250.2 s | 151.5 s | **39%** |
 
 Both points fit one model. A pass at one sample costs about a quarter of a
-uniform 2×2 frame, and refined pixels cost about **2.15×** their share of it —
-that constant comes out of the 400×260 pair as 2.13 and out of the 800×520 pair
-as 2.19, which is the sense in which "the refined set is the expensive set" is a
-number rather than a story:
+uniform 2×2 frame, and refined pixels cost `k` times their share of it — on
+this scene `k` comes out of the 400×260 pair as 2.13 and out of the 800×520
+pair as 2.19, which is the sense in which "the refined set is the expensive
+set" is a number rather than a story:
 
 ```
-adaptive / uniform  =  0.26 + 2.15 * refined_fraction
+adaptive / uniform  =  0.26 + k * refined_fraction
 ```
 
-Extrapolating the fraction to 1920×1080 gives about 10% at threshold 16, so the
-model puts a full HD adaptive frame near **47%** of a uniform one. That is an
-extrapolation of two fits and should be re-measured before it is quoted as a
-result.
+**`k` is a property of the scene, and the extrapolation that ignored that was
+wrong.** Predicting a full HD frame at 47% of uniform from `k = 2.15` and a
+~10% fraction got the fraction right — the torus scene refined 10.5% at
+1920×1080 — and the answer wrong, because that scene's `k` is 4.7 and it came
+in at 76%. Fit `k` on the scene in front of you, at a small resolution where it
+costs a minute, before promising anything about a large one.
 
 **So the feature is aimed at the resolutions where 2×2 hurts**, and it gets
 better exactly as the problem does. At 400×260, where a uniform 2×2 frame costs

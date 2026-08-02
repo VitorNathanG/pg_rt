@@ -244,14 +244,18 @@ one-sample frame where nothing was refined, the full-grid frame where something
 was. There is no third value anywhere in the image, so the tests are equalities
 against renders that already exist rather than tolerances.
 
-It saves 39% at 800×520 and 23% at 400×260, and the gap is the point: edges
+It saves 39% at 800×520 against 23% at 400×260, and the gap is the point: edges
 grow with the width of a frame while pixels grow with its area, so the fraction
-worth refining falls as the frame gets larger. **The catch is that it saves
-about half of what counting pixels suggests**, because contrast selects edges
-and glass, and those are exactly the pixels whose ray trees branch hardest — at
-800×520 the second pass fires 64% of the first pass's rays and does 141% of its
-work. [`research/sampling.md`](research/sampling.md) has the model and the
-numbers.
+worth refining falls as the frame gets larger.
+
+**The catch is that it saves far less than counting pixels suggests**, because
+contrast selects edges and glass, and those are exactly the pixels whose ray
+trees branch hardest. How much less is a property of the scene rather than a
+constant: refining 10.5% of a full HD frame of the torus scene — two rings, one
+of them glass — cost 76% of a uniform 2×2 render, because its second pass fired
+42% of the first pass's rays and did more total work than the entire first
+pass. [`research/sampling.md`](research/sampling.md) has the model, and the
+extrapolation it got wrong.
 
 ### Three levels of bounding volume, one join each
 
