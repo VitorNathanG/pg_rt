@@ -280,6 +280,7 @@ SELECT ok(paeth(0, 100, 0) = 100, 'Paeth picks above');
 SELECT ok(paeth(100, 0, 50) = 50, 'Paeth picks upper-left');
 SELECT ok(paeth(7, 7, 7) = 7, 'Paeth on three equal neighbours is that value');
 
+\echo
 \echo == png decoding ==
 
 -- Reading a PNG back exercises the three pieces that had never been run in
@@ -1441,6 +1442,57 @@ SELECT ok(raises($$INSERT INTO frame (name, w, h, delay_ms) VALUES ('back', 8, 8
           'a frame that is shown for a negative time is refused');
 
 DELETE FROM frame WHERE name LIKE 't_frame%';
+
+-- An animation is a sequence of frame rows and nothing else, so what is checked
+-- is that it takes the right rows, in order, at the rate they asked for.
+INSERT INTO frame (name, w, h, aa, maxdepth, delay_ms)
+VALUES ('t_anim1', 24, 16, 1, 2, 250);
+INSERT INTO frame (name, w, h, aa, maxdepth, delay_ms, cam_from)
+VALUES ('t_anim2', 24, 16, 1, 2, 40, v3(-0.55, 2.35, -6.70));
+SELECT render_frame('t_anim1');
+SELECT render_frame('t_anim2');
+
+CREATE TEMP TABLE t_anim AS SELECT frames_gif('t_anim%') AS g;
+
+SELECT ok(substring(g from 1 for 6) = convert_to('GIF89a', 'SQL_ASCII')
+      AND get_byte(g, 6) + get_byte(g, 7) * 256 = 24
+      AND get_byte(g, 8) + get_byte(g, 9) * 256 = 16
+      AND substring(g from length(g) for 1) = '\x3b'::bytea,
+          'frames_gif writes a GIF at the size of the frames it took')
+FROM t_anim;
+
+SELECT ok(position(convert_to('NETSCAPE2.0', 'SQL_ASCII') in g) > 0,
+          'a sequence loops')
+FROM t_anim;
+
+-- Delays are carried per frame, in hundredths, in frame_id order.  A sequence
+-- that quietly played every frame at one rate would look entirely plausible,
+-- so this is checked against the rows rather than eyed: 250 ms is 25 = 0x19,
+-- 40 ms is 4, both little-endian inside a graphic control extension.
+SELECT ok(position('\x21f9040419000000'::bytea in g) > 0
+      AND position('\x21f9040404000000'::bytea in g) > 0,
+          'each frame carries its own delay, converted to hundredths')
+FROM t_anim;
+
+-- A sequence that silently dropped or repeated a frame would still be a valid
+-- GIF, so the same rows are asked for one at a time and the sizes compared.
+SELECT ok(length(g) > length(frames_gif('t_anim1'))
+      AND position(convert_to('NETSCAPE2.0', 'SQL_ASCII') in frames_gif('t_anim1')) = 0,
+          'two frames make a longer file than one, and one does not loop')
+FROM t_anim;
+
+SELECT ok(raises($$SELECT frames_gif('no-such-frame-%')$$),
+          'asking for an animation of nothing is an error');
+
+-- Frames of different sizes cannot share a screen descriptor, and silently
+-- taking the first size would corrupt every later frame's pixel count.
+INSERT INTO frame (name, w, h, aa, maxdepth) VALUES ('t_anim3', 32, 24, 1, 2);
+SELECT render_frame('t_anim3');
+SELECT ok(raises($$SELECT frames_gif('t_anim%')$$),
+          'frames of different sizes are refused rather than mixed');
+
+DROP TABLE t_anim;
+DELETE FROM frame WHERE name LIKE 't_anim%';
 
 
 \echo == the frame queue ==

@@ -158,3 +158,122 @@ BEGIN
 
   RETURN render_frame(fid, p_verbose);
 END $$ LANGUAGE plpgsql;
+
+-- ---------------------------------------------------------------------------
+-- A sequence of frames as one animated GIF.
+--
+--   SELECT frames_gif('orbit-%');
+--
+-- Frames are taken in frame_id order, which is insertion order, which for a
+-- camera path built out of generate_series is the order it was written in.
+--
+-- ## Why this decodes what it just encoded
+--
+-- `frame` stores the PNG rather than the pixels, and 07's opening comment
+-- gives the reason: a full HD frame is 419 kB of bytea against roughly 100 MB
+-- of rows, which is the difference between keeping a sequence and keeping one
+-- picture.  The bill for that arrives here.  A GIF needs pixels -- it has to
+-- count colours before it can choose 256 of them -- so every frame is inflated
+-- and unfiltered on the way in.
+--
+-- It is the right side of the trade anyway, and by a wide margin: decoding is
+-- seconds a frame against minutes a frame to render, and the alternative is
+-- storing a sequence nobody has room for.  It is also the reason the pixels
+-- are not kept in a table between the two passes below -- the histogram pass
+-- and the indexing pass -- and the raw bytes are.  Same information, 460 kB a
+-- frame instead of 150 000 rows.
+--
+-- ## Why there are two passes at all
+--
+-- The palette has to be chosen over the whole animation before any frame can
+-- be indexed against it.  Quantising each frame on its own is cheaper and
+-- looks worse in a way that is specific to animation: the palette shifts with
+-- the content, so flat areas change colour slightly from frame to frame and
+-- the whole image crawls.  One palette for the sequence costs this second
+-- pass and holds still.
+-- ---------------------------------------------------------------------------
+CREATE FUNCTION frames_gif(p_names text DEFAULT '%', p_colors int DEFAULT 256,
+                           p_dither float8 DEFAULT 0.0, p_loop int DEFAULT 0,
+                           p_verbose boolean DEFAULT false)
+RETURNS bytea AS $$
+DECLARE
+  f      record;
+  fw     int;
+  fh     int;
+  wmax   int;
+  hmax   int;
+  nf     int := 0;
+  k      int := 0;
+  rgb    bytea;
+  images bytea[] := ARRAY[]::bytea[];
+  delays int[]   := ARRAY[]::int[];
+  ts     timestamptz;
+BEGIN
+  SELECT count(*), min(w), max(w), min(h), max(h)
+    INTO nf, fw, wmax, fh, hmax
+  FROM frame WHERE name LIKE p_names AND png IS NOT NULL;
+  IF nf = 0 THEN
+    RAISE EXCEPTION 'no rendered frames match %', p_names;
+  END IF;
+  IF fw <> wmax OR fh <> hmax THEN
+    RAISE EXCEPTION 'frames matching % are not all the same size (% x % to % x %)',
+                    p_names, fw, fh, wmax, hmax;
+  END IF;
+
+  CREATE TEMP TABLE gif_in (ord int PRIMARY KEY, px bytea, delay_cs int);
+  CREATE TEMP TABLE gif_px (x int, y int, r int, g int, b int);
+  PERFORM gif_hist_reset();
+
+  ts := clock_timestamp();
+  FOR f IN SELECT frame_id, png, delay_ms FROM frame
+            WHERE name LIKE p_names AND png IS NOT NULL
+            ORDER BY frame_id LOOP
+    k   := k + 1;
+    rgb := png_raw(f.png);
+    INSERT INTO gif_in (ord, px, delay_cs)
+    VALUES (k, rgb, round(f.delay_ms / 10.0)::int);
+    delays := delays || round(f.delay_ms / 10.0)::int;
+
+    TRUNCATE gif_px;
+    INSERT INTO gif_px (x, y, r, g, b)
+    SELECT (i % fw)::int, (i / fw)::int,
+           get_byte(rgb, i * 3), get_byte(rgb, i * 3 + 1), get_byte(rgb, i * 3 + 2)
+    FROM generate_series(0, fw * fh - 1) AS g(i);
+    PERFORM gif_hist_add('gif_px');
+  END LOOP;
+  IF p_verbose THEN
+    RAISE NOTICE 'decode   : % frames in % ms', nf,
+                 round(extract(epoch FROM clock_timestamp() - ts) * 1000);
+  END IF;
+
+  ts := clock_timestamp();
+  PERFORM gif_palette(p_colors);
+  IF p_verbose THEN
+    RAISE NOTICE 'palette  : % colours from % in % ms',
+                 (SELECT entries FROM gif_meta),
+                 (SELECT count(*) FROM gif_hist),
+                 round(extract(epoch FROM clock_timestamp() - ts) * 1000);
+  END IF;
+
+  ts := clock_timestamp();
+  -- `rgb` goes through a local rather than straight from the column into the
+  -- query, and it has to: a bytea this size is stored out of line, and
+  -- get_byte against a stored value resolves the whole thing on every call.
+  -- See the note that opens 02_deflate.sql -- 741x, measured.
+  FOR f IN SELECT ord, px FROM gif_in ORDER BY ord LOOP
+    rgb := detoast(f.px);
+    TRUNCATE gif_px;
+    INSERT INTO gif_px (x, y, r, g, b)
+    SELECT (i % fw)::int, (i / fw)::int,
+           get_byte(rgb, i * 3), get_byte(rgb, i * 3 + 1), get_byte(rgb, i * 3 + 2)
+    FROM generate_series(0, fw * fh - 1) AS g(i);
+    images := images || gif_image(gif_indices('gif_px', p_dither));
+  END LOOP;
+  IF p_verbose THEN
+    RAISE NOTICE 'index    : % frames in % ms', nf,
+                 round(extract(epoch FROM clock_timestamp() - ts) * 1000);
+  END IF;
+
+  DROP TABLE gif_in, gif_px;
+  RETURN gif_encode(fw, fh, images, delays, p_loop);
+END $$ LANGUAGE plpgsql;

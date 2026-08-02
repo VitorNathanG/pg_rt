@@ -153,6 +153,45 @@ this hole in it.
 So the parameter stays and the default is off. It is the right tool for a
 squeezed palette and dead weight on a full one.
 
+## An animation is one palette, and that is what costs the second pass
+
+Twenty-four frames at 640×400, the camera orbiting the default scene:
+
+| | |
+|---|---|
+| 24 PNGs in `frame` | 2 488 412 bytes |
+| one animated GIF | **1 193 494 bytes** |
+| assembly | 38.4 s |
+
+Assembly splits three ways: **15.9 s decoding** the stored PNGs back to pixels,
+**1.7 s** choosing 256 colours out of the 125 814 the whole sequence contains,
+and **20.8 s** indexing 24 frames against them.
+
+The palette stage is the one that does not grow. It was 1.7 s over 51 442
+colours at 320×200 and it is 1.7 s over 125 814 here, because median cut's cost
+is set by the number of *distinct colours* and by the nine rounds it takes to
+reach 256 — neither of which is the pixel count. Decoding and indexing are both
+per pixel and both went up roughly fourfold, as they should.
+
+The decode is the bill for `frame` storing the PNG rather than the pixels, and
+it is the right side of that trade by a wide margin — seconds a frame against
+minutes a frame to render, and the alternative is a sequence nobody has room
+for. It is also why the raw bytes rather than the pixels are what is kept
+between the two passes: same information, 460 kB a frame instead of 150 000
+rows.
+
+Two passes, because the palette has to be chosen over the whole animation before
+any frame can be indexed against it. Quantising each frame on its own is cheaper
+and looks worse in a way specific to animation: the palette shifts with the
+content, so flat areas change colour slightly from frame to frame and the whole
+image crawls. One palette holds still.
+
+That is also the argument that settles ordered dithering over Floyd–Steinberg,
+independently of how either looks on a still. Error diffusion is sequential —
+each pixel's error moves to neighbours not yet quantised — so it is not
+available here at any price worth paying, and an ordered matrix depends only on
+(x, y), which means it is identical frame to frame and cannot boil.
+
 ## The one thing in LZW that has to be exactly right
 
 When the code width grows. Encoder and decoder never hold the same dictionary at

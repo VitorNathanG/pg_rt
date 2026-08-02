@@ -30,7 +30,7 @@ whose neighbours disagreed with them, which were traced again at four. That is
 ```bash
 docker compose up -d      # PostgreSQL 17
 ./load.sh                 # install the engine and build the default scene
-./test.sh                 # 180 checks on the codecs, the geometry and the optics
+./test.sh                 # 186 checks on the codecs, the geometry and the optics
 ./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
 
@@ -152,8 +152,10 @@ Because the backlog is a table, several sessions can work through it at once:
 `render_next_frame()` claims one row with `FOR UPDATE SKIP LOCKED`, so sessions
 take disjoint frames with no coordination and no work list anywhere — sessions
 can be added or killed mid-run, and one that dies puts its frame straight back
-in the queue. The orbit above is 24 frames: 144 s one at a time, **37 s at
-eight**, byte-identical either way.
+in the queue. On a 24-frame orbit at 320×200 that is 144 s one at a time
+against **37 s at eight**, byte-identical either way; on the heavier one below
+a frame that takes 146 s alone takes 206 s with eight of them running, so
+eight sessions return **5.7×**.
 
 The driver is a shell script because it has to be. Nothing in core PostgreSQL
 starts a background job, and `dblink` and `pg_background` are extensions.
@@ -163,6 +165,44 @@ already went through exposure, the tone curve, gamma and clipping, so keeping
 them would not be a cheaper route back to a differently exposed image than
 re-tracing is — only a much larger one: roughly 100 MB of rows against 419 kB
 of `bytea` for a full HD frame.
+
+### A sequence of frames is an animated GIF
+
+```sql
+SELECT frames_gif('orbit-%');     -- -> bytea
+```
+
+![orbit](examples/orbit.gif)
+
+Twenty-four frames at 640×400, one palette. The frames are taken in `frame_id`
+order and each is shown for its own `delay_ms`, so a hold — the same camera for
+three frames' worth of time — is a column rather than a special case.
+
+The palette is chosen over the *whole* sequence, which costs a second pass and
+is what stops it crawling: quantised frame by frame, flat areas shift colour
+slightly from one to the next and the whole image boils. That same argument
+picks ordered dithering over Floyd–Steinberg regardless of how either looks on a
+still, since an ordered matrix depends only on `(x, y)` and is therefore
+identical between frames. Error diffusion is sequential anyway — each pixel's
+error moves to neighbours that have not been quantised yet — so it was never
+available here.
+
+This is where storing the PNG sends its bill: a GIF needs pixels back, so every
+frame is inflated and unfiltered on the way in. For the orbit above that is 16
+of the 38 s the whole animation takes to assemble — against 615 s to render the
+frames with eight sessions, or 146 s each on their own. The right side of the
+trade by a wide margin, and the first thing that has ever used `inflate` for
+its actual purpose. The 24 stored PNGs are 2.5 MB; the GIF is **1.2 MB**.
+
+The settings on those frames are `aa => 2, refine => 16, maxdepth => 8`, and
+each of the three is fixing a different artifact in the glass —
+`examples/orbit.sql` records what each one is worth. Briefly: depth 4 was
+discarding 35 660 live hits and every pixel it touched came out too dark, for
+no saving at all; one sample per pixel leaves the three dispersed channels
+landing on different checker squares, which reads as coloured speckle; and the
+resolution does not reduce that speckle's *rate* — 1.66% of pixels against
+1.76% — it makes each speckle a quarter of the area, which is what turns
+blotches into sparkle.
 
 `examples/torus_scene.sql` builds the scene at the top of this page from
 `examples/torus.obj` — two copies of one OBJ at different sizes and angles,
@@ -430,8 +470,8 @@ once.
 | `sql/05_trace.sql` | Fresnel, absorption, direct lighting, ray spawning |
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
 | `sql/07_frame.sql` | the frame table, the render that stores its result, the queue |
-| `test/tests.sql` | 180 checks |
-| `examples/` | a torus OBJ, the scene that loads it, a camera orbit, a moving scene |
+| `test/tests.sql` | 186 checks |
+| `examples/` | a torus OBJ, the scene that loads it, a camera orbit and its GIF, a moving scene |
 | [`research/`](research) | the measurements behind the design |
 
 ## Notes and limitations
