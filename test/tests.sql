@@ -1102,6 +1102,66 @@ FROM img i JOIN one_light o USING (x, y) WHERE i.b > o.b;
 DELETE FROM light WHERE name = 'fill';
 
 \echo
+\echo == adaptive sampling ==
+
+-- An adaptive frame is not an approximation of a uniform one, and this is the
+-- check that says so.  Every pixel in it is bit-for-bit a pixel of one of two
+-- renders that already exist: the coarse frame where nothing was refined, the
+-- fine frame where something was.  That holds because a refined pixel throws
+-- its coarse sample away and re-samples on exactly the grid a uniform render
+-- would have used, so there is no third value anywhere in the image and no
+-- tolerance anywhere in this file.
+--
+-- It is also the check that would catch the mistake worth worrying about.
+-- Keeping the coarse sample instead of discarding it, or dividing by the wrong
+-- count, produces a picture that looks entirely plausible -- slightly wrong
+-- only at the pixels that were refined, which are the pixels a reader is least
+-- able to eyeball.
+SELECT render(48, 32, 1, 3);
+CREATE TEMP TABLE aa_coarse AS SELECT * FROM img;
+SELECT render(48, 32, 2, 3);
+CREATE TEMP TABLE aa_fine AS SELECT * FROM img;
+SELECT render(48, 32, 2, 3, 1.35, 0.01, false, cam_from(), cam_at(), cam_fov(), 16);
+
+SELECT ok(count(*) = 0, 'every pixel of an adaptive frame comes from one of the two uniform ones')
+FROM img i JOIN aa_coarse c USING (x, y) JOIN aa_fine f USING (x, y)
+WHERE (i.r, i.g, i.b) IS DISTINCT FROM (c.r, c.g, c.b)
+  AND (i.r, i.g, i.b) IS DISTINCT FROM (f.r, f.g, f.b);
+
+-- ... and it has to have refined something, or the check above is satisfied by
+-- a renderer that ignores the threshold entirely.
+SELECT ok(count(*) > 0, 'an adaptive frame differs from the coarse one it began as')
+FROM img i JOIN aa_coarse c USING (x, y)
+WHERE (i.r, i.g, i.b) IS DISTINCT FROM (c.r, c.g, c.b);
+
+-- The two ends of the threshold.  Above the largest contrast 8-bit channels
+-- can hold, nothing is selected and the second pass never runs; the frame is
+-- the one-sample frame exactly.
+SELECT render(48, 32, 2, 3, 1.35, 0.01, false, cam_from(), cam_at(), cam_fov(), 255);
+SELECT ok(count(*) = 0, 'a threshold no pair of pixels can exceed refines nothing')
+FROM img i JOIN aa_coarse c USING (x, y)
+WHERE (i.r, i.g, i.b) IS DISTINCT FROM (c.r, c.g, c.b);
+
+-- Lowering it can only ever select more pixels, since the test is a strict
+-- inequality against one number -- so the frame it produces must agree with
+-- the fine render everywhere the stricter one did, and possibly further.
+SELECT render(48, 32, 2, 3, 1.35, 0.01, false, cam_from(), cam_at(), cam_fov(), 64);
+CREATE TEMP TABLE aa_loose AS SELECT * FROM img;
+SELECT render(48, 32, 2, 3, 1.35, 0.01, false, cam_from(), cam_at(), cam_fov(), 4);
+SELECT ok((SELECT count(*) FROM img i JOIN aa_fine f USING (x, y)
+           WHERE (i.r, i.g, i.b) = (f.r, f.g, f.b))
+       >= (SELECT count(*) FROM aa_loose l JOIN aa_fine f USING (x, y)
+           WHERE (l.r, l.g, l.b) = (f.r, f.g, f.b)),
+          'a lower threshold agrees with the fine render on no fewer pixels');
+
+-- Refining a one-sample render to one sample is not a request that can mean
+-- anything, and it costs a whole second pass to honour literally.
+SELECT render(48, 32, 1, 3, 1.35, 0.01, false, cam_from(), cam_at(), cam_fov(), 1);
+SELECT ok(count(*) = 0, 'a refinement rate equal to the base rate is not a refinement')
+FROM img i JOIN aa_coarse c USING (x, y)
+WHERE (i.r, i.g, i.b) IS DISTINCT FROM (c.r, c.g, c.b);
+
+\echo
 \echo == camera ==
 
 -- A camera moved along its own view axis must change the picture.  This looks

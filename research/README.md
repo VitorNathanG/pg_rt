@@ -13,6 +13,8 @@ are not portable; the ratios are the part that carries.
 | [`query-shape.md`](query-shape.md) | Joins against loops, why the bounce loop is not a recursive CTE, `CREATE TABLE AS` against `INSERT`, and why JIT is off |
 | [`bvh.md`](bvh.md) | Morton-ordered leaves, leaf-size sweeps, the triangle box, and the third level that was built and rejected |
 | [`timings.md`](timings.md) | Per-phase and per-resolution breakdowns, scaling with light count, and what a full HD frame costs in bytes |
+| [`deflate.md`](deflate.md) | The PNG compressor: accumulators, a quadratic detoast, Huffman under a depth cap, and why per-scanline filtering loses here |
+| [`sampling.md`](sampling.md) | Adaptive antialiasing: why a refined pixel discards its coarse sample, and why selecting edges selects the expensive rays |
 
 Two habits these notes assume, both learned the hard way:
 

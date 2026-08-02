@@ -21,7 +21,7 @@ triangle meshes, and the tracer does not know which is which.
 ```bash
 docker compose up -d      # PostgreSQL 17
 ./load.sh                 # install the engine and build the default scene
-./test.sh                 # 149 checks on the codec, the geometry and the optics
+./test.sh                 # 154 checks on the codec, the geometry and the optics
 ./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
 
@@ -225,6 +225,33 @@ inside each iteration becomes an ordinary aggregating join. The loop is
 bounded by `maxdepth` and exits early when no rays survive the throughput
 cutoff.
 
+### Deciding where to spend rays is a `WHERE` clause
+
+Antialiasing costs four times the rays for 2×2 samples, and most of a frame
+does not need them. Given a threshold, `render()` traces the picture at one
+sample, asks the result which pixels its neighbours disagree with by more than
+that many 8-bit levels, and traces only those again at the full grid:
+
+```sql
+SELECT render_png(1920, 1080, 2, 5, p_refine => 16);
+```
+
+A refined pixel **discards** its coarse sample rather than averaging it in,
+which costs one traced ray and buys an exact property: every pixel of an
+adaptive frame is bit-for-bit a pixel of one of two uniform renders — the
+one-sample frame where nothing was refined, the full-grid frame where something
+was. There is no third value anywhere in the image, so the tests are equalities
+against renders that already exist rather than tolerances.
+
+It saves 39% at 800×520 and 23% at 400×260, and the gap is the point: edges
+grow with the width of a frame while pixels grow with its area, so the fraction
+worth refining falls as the frame gets larger. **The catch is that it saves
+about half of what counting pixels suggests**, because contrast selects edges
+and glass, and those are exactly the pixels whose ray trees branch hardest — at
+800×520 the second pass fires 64% of the first pass's rays and does 141% of its
+work. [`research/sampling.md`](research/sampling.md) has the model and the
+numbers.
+
 ### Three levels of bounding volume, one join each
 
 The mesh box rejects whole objects, the BVH leaf rejects clusters of triangles,
@@ -308,6 +335,7 @@ obvious approach, which is why they are recorded rather than rediscovered:
 | [`research/bvh.md`](research/bvh.md) | Leaf sizing, the triangle box, and the level that was rejected |
 | [`research/deflate.md`](research/deflate.md) | Where the bytes live, why the block chooser has to cost the whole block, and what the filters are worth |
 | [`research/timings.md`](research/timings.md) | Per-phase and per-resolution breakdowns, and what a full HD frame costs in bytes |
+| [`research/sampling.md`](research/sampling.md) | Adaptive antialiasing, and why selecting the edges selects the expensive rays |
 
 `render(..., p_verbose => true)` reports each phase as it goes, which is the
 quickest way to see where a particular scene is spending its time.
@@ -335,7 +363,7 @@ once.
 | `sql/05_trace.sql` | Fresnel, absorption, direct lighting, ray spawning |
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
 | `sql/07_frame.sql` | the frame table, the render that stores its result, the queue |
-| `test/tests.sql` | 149 checks |
+| `test/tests.sql` | 154 checks |
 | `examples/` | a torus OBJ, the scene that loads it, a camera orbit, a moving scene |
 | [`research/`](research) | the measurements behind the design |
 
