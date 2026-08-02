@@ -36,6 +36,19 @@ CREATE TABLE frame (
   -- so it shares a scale with the image rather than with the sampler.
   refine      int,
 
+  -- How long this frame is shown for when the sequence is played back.  It
+  -- belongs on the frame rather than on whatever assembles the animation
+  -- because a hold -- the same camera for three frames' worth of time -- is a
+  -- property of the shot, and a format that only carries one rate for the
+  -- whole file cannot express it.
+  --
+  -- Milliseconds, because that is what anyone thinks in; GIF stores hundredths
+  -- of a second and rounds, and the default of 40 ms happens to be exactly 4
+  -- of them.  Going faster than 20 ms is not worth asking for: browsers have
+  -- clamped delays below two hundredths for twenty-five years, historically up
+  -- to ten, so a 10 ms animation plays slower than a 20 ms one.
+  delay_ms    int    NOT NULL DEFAULT 40,
+
   -- The camera lives on the frame, not on the geometry.  A camera is a
   -- property of a view of a scene rather than of the scene, which is what
   -- makes a hundred viewpoints a hundred rows instead of a hundred databases.
@@ -49,6 +62,7 @@ CREATE TABLE frame (
 
   CHECK (w > 0 AND h > 0 AND aa > 0 AND maxdepth >= 0),
   CHECK (refine IS NULL OR refine >= 0),
+  CHECK (delay_ms >= 0),
   CHECK (cam_fov > 0.0 AND cam_fov < 180.0),
   CHECK ((cam_from).x <> (cam_at).x OR (cam_from).y <> (cam_at).y
       OR (cam_from).z <> (cam_at).z)

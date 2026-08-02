@@ -1267,6 +1267,9 @@ SELECT ok((SELECT png FROM frame WHERE name = 't_frame3')
 SELECT ok(raises($$INSERT INTO frame (name, w, h, refine) VALUES ('neg', 8, 8, -1)$$),
           'a frame with a negative refinement threshold is refused');
 
+SELECT ok(raises($$INSERT INTO frame (name, w, h, delay_ms) VALUES ('back', 8, 8, -1)$$),
+          'a frame that is shown for a negative time is refused');
+
 DELETE FROM frame WHERE name LIKE 't_frame%';
 
 
