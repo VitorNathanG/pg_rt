@@ -11,10 +11,17 @@ SELECT render(600, 400, 2, 5);                       -- trace into the table `im
 SELECT png_encode(600, 400, png_scanlines('img'));   -- -> bytea
 ```
 
-![render](out.png)
+![torus](examples/torus_fullhd.png)
 
-A checkered ground plane, a metal sphere and a glass cube — all three are
-triangle meshes, and the tracer does not know which is which.
+Two copies of one OBJ, one copper and one crown glass, at 1920×1080. Every
+surface in it is triangles — 8 194 of them — and the tracer does not know which
+is a ring and which is a floor. The colour along the glass edges is dispersion:
+each channel refracts at its own index, so a white ray entering the glass
+leaves as three.
+
+It was traced at one sample per pixel everywhere except the 9.7% of pixels
+whose neighbours disagreed with them, which were traced again at four. That is
+`p_refine`, and it is a `WHERE` clause.
 
 ## Running it
 
@@ -24,6 +31,14 @@ docker compose up -d      # PostgreSQL 17
 ./test.sh                 # 156 checks on the codec, the geometry and the optics
 ./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
+
+That last line produces the default scene, which is what `load.sh` builds and
+what every test in the suite is written against:
+
+![render](out.png)
+
+A checkered ground plane, a metal sphere and a glass cube — all three are
+triangle meshes, and the tracer does not know which is which.
 
 ## Geometry lives in tables
 
@@ -144,18 +159,17 @@ them would not be a cheaper route back to a differently exposed image than
 re-tracing is — only a much larger one: roughly 100 MB of rows against 419 kB
 of `bytea` for a full HD frame.
 
-`examples/torus_scene.sql` builds a scene from `examples/torus.obj` — two
-copies of one OBJ at different sizes and angles, wearing different materials:
+`examples/torus_scene.sql` builds the scene at the top of this page from
+`examples/torus.obj` — two copies of one OBJ at different sizes and angles,
+wearing different materials:
 
 ![torus](examples/torus.png)
 
-The same scene at 1920x1080 is
-[`examples/torus_fullhd.png`](examples/torus_fullhd.png) — one sample per
-pixel, 604 kB where the same frame was 6.2 MB before the encoder could
-compress. Its pixels were never re-traced for that: the old file was read back
-in through this engine's own `inflate` and written out again. Re-rendering it
-afterwards produced the identical file, byte for byte, which is a
-better check on the round trip than any test could be.
+The mesh is 4 096 triangles a ring, and that number was chosen by measuring
+rather than by eye. At the 1 024 it started from, the tessellation was visible
+at 1920×1080 in the silhouettes and through the glass; quadrupling it costs
+only 1.29× the frame, because the BVH sizes its leaves at `sqrt(n)/3` so a
+ray's cost grows as √n while the ray count does not move at all.
 
 The OBJ reader handles `v`, `vn` and `f`, polygons of any size
 (fan-triangulated), all of the `1`, `1/2`, `1//3` and `1/2/3` corner

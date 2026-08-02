@@ -2,15 +2,25 @@
 -- An arbitrary mesh, loaded from a Wavefront OBJ, with materials picked per
 -- mesh.  Nothing in the tracer knows what a torus is.
 --
---   docker exec -i pg_rt psql -U rt -d rt \
---     -v obj="$(sed -e 's/'"'"'/'"''"'/g' examples/torus.obj)" \
---     -f examples/torus_scene.sql
+--   docker cp examples/torus.obj       pg_rt:/tmp/
+--   docker cp examples/torus_scene.sql pg_rt:/tmp/
+--   printf '\\set obj `cat /tmp/torus.obj`\n\\i /tmp/torus_scene.sql\n' \
+--     | docker exec -i pg_rt psql -U rt -d rt
 --
--- or, more simply, from a psql session started in the repository root:
+-- The mesh goes through the container's filesystem rather than through a psql
+-- variable on the command line, and that is not fussiness.  A -v obj="$(cat
+-- ...)" puts 212 kB of OBJ into argv, which docker exec refuses outright --
+-- and if stderr is being discarded it refuses *silently*, leaving whatever
+-- scene was already loaded in place to be rendered and measured as though it
+-- were the new one.  psql's own backtick runs inside the container, so the
+-- file never reaches an argument list.
+--
+-- From a psql session on the host, started in the repository root, the short
+-- form still works -- \set builds the variable internally:
 --
 --   \set obj `cat examples/torus.obj`
 --   \i examples/torus_scene.sql
---   SELECT render(480, 320, 2, 5);
+--   SELECT render(480, 320, 2, 5, p_refine => 16);
 -- ---------------------------------------------------------------------------
 
 BEGIN;

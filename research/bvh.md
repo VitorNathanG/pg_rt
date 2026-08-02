@@ -41,8 +41,13 @@ every triangle in it. A slab test costs about a third of a triangle test, so a
 box on the triangle itself pays as soon as it rejects a third of what reaches
 it — and it rejects far more.
 
-Worth **1.09×** on the default scene and about **1.6×** on the 2050-triangle
-torus, under both machine profiles. The win grows with the mesh.
+Worth **1.09×** on the default scene and about **1.6×** on the torus, under
+both machine profiles. The win grows with the mesh.
+
+That torus was 2050 triangles when this was measured and the shipped one is now
+8194, so expect the gap to have widened rather than closed — the figures here
+are not re-measured against the finer mesh, and every torus number on this page
+predates it.
 
 It is six `GENERATED ALWAYS ... STORED` columns rather than a table, so it
 cannot drift from the vertices it summarises, and it is stored flat with no

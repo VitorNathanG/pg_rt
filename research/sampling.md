@@ -103,6 +103,15 @@ more a scene is made of glass the worse the trade gets. A scene of diffuse
 surfaces would refine at close to its pixel fraction; this one refines at four
 and a half times it.
 
+**Those figures are from the torus scene as it then was**, at 1024 triangles a
+ring and an index spread of 0.135. The shipped scene has since gone to 4096 and
+0.060, and the refined fraction moved with both — 10.50% to 10.30% on the mesh,
+then to **9.74%** on the glass. Neither is large, but the ordering is worth
+keeping: quadrupling the triangles moved it by 0.20 points while halving the
+dispersion moved it by 0.56, so of the two artifacts that look like they ought
+to be inflating the refined set, the colour fringing was about three times the
+facets, and both are minor beside the genuine geometry edges that dominate it.
+
 ## What it actually costs
 
 At 400×260, against the uniform renders it sits between:
