@@ -326,3 +326,17 @@ canonical Huffman decoder needs the symbols in canonical order and a count per
 code length, and both fall straight out of an `ORDER BY`. Building the table is
 four lines of SQL. Using it is a loop, because a join per symbol decoded would
 be an SPI round trip per symbol.
+
+It is not slow in the way "it will be slow" expected, either. The first real
+thing it was pointed at was a 6.2 MB PNG this engine had written months
+earlier, taken back to pixels through `png_idat`, `zlib_inflate` and
+`png_unfilter`:
+
+| | |
+|---|---|
+| 6.2 MB of stored blocks → 6 220 800 raw bytes | 3.5 s |
+| rebuilding `img` from those bytes, 2 073 600 rows | 0.07 s |
+| re-encoding the result at full HD | 13 s |
+
+Decoding is a third of the cost of encoding, which is the usual shape — the
+decoder is told what to do, where the encoder had to search for it.
