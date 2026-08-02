@@ -99,6 +99,188 @@ FROM (SELECT png_encode(2, 2, decode('00' || repeat('ff0000', 2)
                                   || '00' || repeat('0000ff', 2), 'hex'))) AS q(p);
 
 \echo
+\echo == deflate ==
+
+-- Four streams produced by a real zlib, decoded here.
+--
+-- These are the only checks in the file with an oracle outside this repository,
+-- and that is the whole point of them.  Everything else about the codec is
+-- verified by compressing and then decompressing, which passes just as happily
+-- when the encoder and the decoder are wrong in the same direction -- a
+-- mirrored bit order, a mis-numbered code table.  A byte string this
+-- repository did not produce cannot agree with a private mistake.
+SELECT ok(inflate('\x2bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a75b8379e88a8b7352530b8af500'::bytea)
+          = convert_to('the quick brown fox jumps over the lazy dog; '
+                    || 'the quick brown fox sleeps.', 'SQL_ASCII'),
+          'inflate reads a dynamic-Huffman block written by zlib');
+SELECT ok(inflate('\x4b4c048224100000'::bytea) = 'aaaaabbbbb'::bytea,
+          'inflate reads a fixed-Huffman block written by zlib');
+SELECT ok(inflate('\x010400fbff00010203'::bytea) = '\x00010203'::bytea,
+          'inflate reads a stored block written by zlib');
+SELECT ok(zlib_inflate('\x78da0bc82f2e492f4a0d0ef4010015f403d5'::bytea) = 'PostgreSQL'::bytea,
+          'zlib_inflate reads a real zlib stream, checksum and all');
+
+-- Every level must round-trip every shape.  The shapes are chosen for the
+-- branches they reach rather than for variety: an empty and a one-byte buffer
+-- for the degenerate trees, a long run for the 258-byte match cap, prose for
+-- ordinary matching, zeroes for a single dominant symbol, and md5 output for
+-- input with nothing in it to find.
+SELECT ok(bool_and(inflate(deflate(b, lvl)) = b),
+          'deflate round-trips through inflate at every level')
+FROM (VALUES (''::bytea), ('A'::bytea), ('AB'::bytea),
+             (decode(repeat('61', 1000), 'hex')),
+             (convert_to(repeat('the quick brown fox jumps over the lazy dog. ', 50),
+                         'SQL_ASCII')),
+             (decode(repeat('00', 5000), 'hex')),
+             ((SELECT decode(string_agg(md5(g::text), ''), 'hex')
+               FROM generate_series(1, 500) AS g))) AS v(b),
+     generate_series(0, 9) AS lvl;
+
+SELECT ok(bool_and(zlib_inflate(zlib_deflate(b, lvl)) = b),
+          'the zlib wrapper round-trips at every level')
+FROM (VALUES (''::bytea), ('A'::bytea),
+             (convert_to(repeat('abcabcabd', 200), 'SQL_ASCII'))) AS v(b),
+     generate_series(0, 9) AS lvl;
+
+SELECT ok(length(deflate(convert_to(repeat('the quick brown fox. ', 400), 'SQL_ASCII'), 6)) * 20
+          < 8400,
+          'a repetitive buffer compresses by more than 20x');
+
+-- 20000 bytes of one value is 77 matches at the 258-byte cap, and 258 is the
+-- length that has its own code.  Reaching it the other way -- code 284 with
+-- all five extra bits set -- also decodes to 258, so nothing round-trips
+-- differently and only the size says which was used: 37 bytes against 85.
+SELECT ok(length(deflate(decode(repeat('61', 20000), 'hex'), 6)) < 50,
+          'the longest match uses length code 285 rather than 284 plus extra bits');
+
+-- The property the block chooser exists to guarantee, and the one that caught
+-- the cost model leaving out extra bits: incompressible input must never come
+-- back bigger than a stored block, however tempting the Huffman estimate
+-- looks.  70000 bytes also puts it over the 65535 stored-block limit, so the
+-- multi-block path is on the same check.
+SELECT ok(length(deflate(b, 6)) <= length(b) + 5 * (length(b) / 65535 + 1),
+          'incompressible input never grows past a stored block')
+FROM (SELECT decode(string_agg(md5(g::text), ''), 'hex')
+      FROM generate_series(1, 4375) AS g) AS q(b);
+
+-- Twenty symbols with Fibonacci frequencies, shuffled by md5 so the match
+-- finder has nothing to collapse.  That distribution wants a 19-deep tree and
+-- DEFLATE allows 15, so this is the input that makes the cap load-bearing
+-- rather than theoretical -- and it has to reach the encoder through deflate()
+-- itself, because a tree deep enough to be illegal is emitted as a legal-
+-- looking stream that decodes to rubbish.
+SELECT ok(inflate(deflate(v, 6)) = v AND length(deflate(v, 6)) < length(v),
+          'a distribution that wants codes longer than 15 bits still round-trips')
+FROM (WITH RECURSIVE fib(i, a, b) AS (
+        SELECT 0, 1::bigint, 1::bigint
+        UNION ALL SELECT i + 1, b, a + b FROM fib WHERE i < 19)
+      SELECT decode(string_agg(lpad(to_hex(i), 2, '0'), ''
+                               ORDER BY md5((i * 99991 + k)::text)), 'hex')
+      FROM fib, generate_series(1, a) AS k) AS q(v);
+
+-- The far edge of the window, from both sides.  A 64-byte block is repeated at
+-- distance 32768, which is the largest DEFLATE can encode, and again at 32769,
+-- which it cannot.  The first must be found and the second must be passed over
+-- -- and getting the boundary wrong by one is not a missed byte of ratio, it
+-- is a distance with no code to write it in.
+SELECT ok(bool_and(inflate(d) = v)
+          AND bool_or(gap = 32768 AND length(d) < length(v))
+          AND bool_or(gap = 32769 AND length(d) > length(v)),
+          'a match at distance 32768 is used and one at 32769 is not')
+FROM (SELECT gap, p || substring(fill FROM 1 FOR gap - 64) || p
+      FROM generate_series(32768, 32769) AS gap,
+           (SELECT decode(string_agg(md5((g * 7)::text), ''), 'hex')
+            FROM generate_series(1, 4) AS g) AS a(p),
+           (SELECT decode(string_agg(md5((g * 13 + 1)::text), ''), 'hex')
+            FROM generate_series(1, 2100) AS g) AS b(fill)) AS q(gap, v),
+     LATERAL (SELECT deflate(v, 6)) AS z(d);
+
+-- Reading a bytea out of a table is the case that goes quadratic if anyone
+-- forgets to detoast: the argument arrives as a pointer, and `get_byte`
+-- resolves it again on every call.  The timeout is what makes this a test
+-- rather than a comment, because both answers are *correct* and only one of
+-- them finishes -- 1.6 s here against about two minutes without, on 512 kB.
+-- The gap is wide enough that the threshold is not delicate.
+-- Both columns are stored, so both directions are exercised against a pointer
+-- rather than against a value that happens to still be in memory.
+CREATE TEMP TABLE toasty AS
+SELECT b, deflate(b, 6) AS z
+FROM (SELECT decode(string_agg(md5(s.g::text), ''), 'hex')
+      FROM generate_series(1, 32768) AS s(g)) AS q(b);
+
+SET statement_timeout = '20s';
+SELECT ok(deflate((SELECT b FROM toasty), 6) = (SELECT z FROM toasty)
+          AND inflate((SELECT z FROM toasty)) = (SELECT b FROM toasty)
+          AND adler32((SELECT b FROM toasty)) > 0
+          AND crc32((SELECT b FROM toasty)) > 0,
+          'a bytea read from a table is read once, not once per byte');
+RESET statement_timeout;
+
+SELECT ok(raises($$SELECT zlib_inflate('\x78da0bc82f2e492f4a0d0ef4010015f403d6'::bytea)$$),
+          'zlib_inflate rejects a stream whose Adler-32 does not match');
+SELECT ok(raises($$SELECT zlib_inflate('\x0000'::bytea)$$),
+          'zlib_inflate rejects a header that is not deflate');
+SELECT ok(raises($$SELECT inflate('\x07'::bytea)$$),
+          'inflate rejects the reserved block type');
+
+-- A stored block repeats its length inverted, and that is the only integrity
+-- check DEFLATE has before the zlib trailer.  The same block with the last
+-- NLEN byte changed from ff to fe still has a length that looks perfectly
+-- reasonable, so a decoder that skips the comparison copies four bytes and
+-- reports success.
+SELECT ok(inflate('\x010400fbff00010203'::bytea) = '\x00010203'::bytea
+          AND raises($$SELECT inflate('\x010400fbfe00010203'::bytea)$$),
+          'inflate rejects a stored block whose NLEN is not ~LEN');
+
+-- Kraft equality: a prefix code is complete exactly when its lengths use up
+-- all the code space.  Short of decoding something, this is the strongest
+-- statement that can be made about a set of code lengths, and it fails for
+-- every off-by-one a tree builder can make.  The sum is exact in float8 --
+-- every term is a power of two no smaller than 2^-15.
+SELECT ok(sum(2.0 ^ (-len)) = 1.0, 'huff_lengths produces a complete code')
+FROM unnest(huff_lengths((SELECT array_agg((g * 37 + 11) % 97 + 1)
+                          FROM generate_series(1, 286) AS g))) AS u(len)
+WHERE len > 0;
+
+-- Fibonacci weights are the worst case for tree depth -- each merge is only
+-- just heavier than the next leaf -- so 40 of them build a 39-deep tree that
+-- DEFLATE cannot express.  The cap has to bite here, and the result has to
+-- still be a complete code.
+SELECT ok(max(len) <= 15 AND sum(2.0 ^ (-len)) = 1.0,
+          'code lengths stay within 15 bits on a Fibonacci-shaped distribution')
+FROM (WITH RECURSIVE fib(i, a, b) AS (
+        SELECT 1, 1::bigint, 1::bigint
+        UNION ALL SELECT i + 1, b, a + b FROM fib WHERE i < 40)
+      SELECT unnest(huff_lengths((SELECT array_agg(a ORDER BY i) FROM fib)))) AS u(len)
+WHERE len > 0;
+
+-- The decoder walks `sym` in canonical order and uses `cnt` to know where each
+-- length's run ends, so those two have to agree with each other and with the
+-- lengths: every used symbol listed exactly once, sorted by length, and
+-- counted.  A symbol dropped or transposed here decodes into plausible
+-- rubbish rather than failing.
+SELECT ok(array_length(t.sym, 1) = (SELECT count(*) FROM unnest(q.lens) AS x(v) WHERE v > 0)
+          AND (SELECT sum(c) FROM unnest(t.cnt) AS u(c)) = array_length(t.sym, 1)
+          AND (SELECT bool_and(q.lens[t.sym[i] + 1] <= q.lens[t.sym[i + 1] + 1])
+               FROM generate_series(1, array_length(t.sym, 1) - 1) AS i),
+          'huff_decode_table lists every used symbol once, in canonical order')
+FROM (SELECT array_agg((g * 37 + 11) % 9 + (g % 4) ORDER BY g)
+      FROM generate_series(1, 100) AS g) AS q(lens),
+     LATERAL huff_decode_table(q.lens) AS t;
+
+\echo
+\echo == png filters ==
+
+-- The Paeth predictor picks whichever neighbour is closest to the linear
+-- estimate a + b - c.  The three cases have to be checked separately because
+-- the cancelled form this file uses -- |b-c|, |a-c|, |a+b-2c| -- shares no
+-- subexpression with the definition it replaces.
+SELECT ok(paeth(10, 20, 30) = 10, 'Paeth picks left when it is nearest');
+SELECT ok(paeth(0, 100, 0) = 100, 'Paeth picks above');
+SELECT ok(paeth(100, 0, 50) = 50, 'Paeth picks upper-left');
+SELECT ok(paeth(7, 7, 7) = 7, 'Paeth on three equal neighbours is that value');
+
+\echo
 \echo == vector algebra ==
 
 SELECT ok(near(v3_dot(v3(1,2,3), v3(4,-5,6)), 12), 'dot product');
@@ -776,9 +958,88 @@ SELECT ok(count(*) = 24 * 16, 'render fills every pixel exactly once') FROM img;
 SELECT ok(bool_and(r BETWEEN 0 AND 255 AND g BETWEEN 0 AND 255 AND b BETWEEN 0 AND 255),
           'all samples are within 8-bit range') FROM img;
 SELECT ok(count(DISTINCT (r,g,b)) > 8, 'the render is not a flat fill') FROM img;
-SELECT ok(length(png_encode(24, 16, png_scanlines('img'))) = 8 + 25 + 12 + 12
-                                                             + length(zlib_stored(png_scanlines('img'))),
-          'PNG length is signature + IHDR + IDAT + IEND');
+SELECT ok(length(p) = 8 + 25 + 12 + length(png_idat(p)) + 12,
+          'PNG length is signature + IHDR + IDAT + IEND')
+FROM (SELECT png_encode(24, 16, png_scanlines('img'))) AS q(p);
+
+-- Filters are a claim about *predicting* bytes, never about changing them, so
+-- every type has to reconstruct the identical image.  Forcing each in turn is
+-- what makes this discriminating: the adaptive path picks whichever filter is
+-- cheapest per row and can leave a broken one untouched for an entire render.
+SELECT ok(bool_and(png_unfilter(png_scanlines('img', f), 24, 16)
+                   = png_unfilter(png_scanlines('img', 0), 24, 16)),
+          'all five filter types reconstruct the same pixels')
+FROM generate_series(0, 4) AS f;
+
+SELECT ok(png_unfilter(png_scanlines('img'), 24, 16)
+          = png_unfilter(png_scanlines('img', 0), 24, 16)
+          AND png_unfilter(png_scanlines('img', -2), 24, 16)
+          = png_unfilter(png_scanlines('img', 0), 24, 16),
+          'both filter-choosing modes reconstruct the same pixels');
+
+-- The default measures rather than predicts, so it can never be beaten by
+-- either of the candidates it chose between.
+SELECT ok(length(deflate(png_scanlines('img'), 6))
+          <= least(length(deflate(png_scanlines('img', 0), 6)),
+                   length(deflate(png_scanlines('img', 1), 6))),
+          'the chosen filter is no worse than either candidate');
+
+SELECT ok(bool_and(ft BETWEEN 0 AND 4), 'every scanline carries a legal filter byte')
+FROM generate_series(0, 15) AS y,
+     LATERAL (SELECT get_byte(png_scanlines('img'), y * (24 * 3 + 1))) AS q(ft);
+
+-- The per-row chooser (-2) has to actually choose: for every row, the filter it
+-- marks must be the one with the smallest sum of absolute signed residuals.
+--
+-- The oracle is the forced-filter output itself, which is what keeps this from
+-- being a copy of the implementation -- the costs below are summed from the
+-- bytes png_scanlines(img, f) really emitted, not from a second evaluation of
+-- the predictors.  Ties go to the lower filter number on both sides.
+SELECT ok(bool_and(best.f = chosen.f),
+          'each scanline is marked with the cheapest of the five filters')
+FROM (SELECT DISTINCT ON (y) y, f
+      FROM (SELECT y, f, sum(least(v, 256 - v)) AS c
+            FROM generate_series(0, 4) AS f,
+                 LATERAL (SELECT png_scanlines('img', f)) AS s(b),
+                 generate_series(0, 15) AS y,
+                 generate_series(0, 24 * 3 - 1) AS i,
+                 LATERAL (SELECT get_byte(b, y * (24 * 3 + 1) + 1 + i)) AS q(v)
+            GROUP BY y, f) AS cost
+      ORDER BY y, c, f) AS best
+     JOIN (SELECT y, get_byte(png_scanlines('img', -2), y * (24 * 3 + 1)) AS f
+           FROM generate_series(0, 15) AS y) AS chosen USING (y);
+
+-- IHDR is the one part of a PNG that says what the rest of it means, and until
+-- there was a decoder here nothing read it back.  Colour type 2 is the claim
+-- that a pixel is three bytes; the inflated length is what makes that claim
+-- checkable rather than decorative.
+SELECT ok(get_byte(p, 16) * 16777216 + get_byte(p, 17) * 65536
+        + get_byte(p, 18) * 256 + get_byte(p, 19) = 24
+      AND get_byte(p, 20) * 16777216 + get_byte(p, 21) * 65536
+        + get_byte(p, 22) * 256 + get_byte(p, 23) = 16
+      AND get_byte(p, 24) = 8      -- bits per sample
+      AND get_byte(p, 25) = 2      -- truecolour: three samples, no alpha
+      AND get_byte(p, 26) = 0      -- compression method: deflate
+      AND get_byte(p, 27) = 0      -- filter method: the five adaptive filters
+      AND get_byte(p, 28) = 0      -- not interlaced
+      AND length(zlib_inflate(png_idat(p))) = 16 * (24 * 3 + 1),
+          'IHDR describes the image that was actually written')
+FROM (SELECT png_encode(24, 16, png_scanlines('img'))) AS q(p);
+
+-- The whole loop, inside the database: pixels to PNG and back.  This is what
+-- inflate buys even though nothing renders with it -- until it existed, a PNG
+-- was write-only here and there was no way to ask whether one was right.
+SELECT ok(png_unfilter(zlib_inflate(png_idat(p)), 24, 16)
+          = (SELECT decode(string_agg(lpad(to_hex(r), 2, '0') || lpad(to_hex(g), 2, '0')
+                                   || lpad(to_hex(b), 2, '0'), '' ORDER BY y, x), 'hex')
+             FROM img),
+          'a PNG decodes back to the exact pixels it was made from')
+FROM (SELECT png_encode(24, 16, png_scanlines('img'))) AS q(p);
+
+SELECT ok(raises($$SELECT png_idat('\x0011223344556677'::bytea)$$),
+          'png_idat refuses something that is not a PNG');
+SELECT ok(raises($$SELECT png_unfilter('\x0000'::bytea, 24, 16)$$),
+          'png_unfilter refuses scanlines of the wrong length');
 
 -- The two halves of "lights are rows": a second light must travel the whole
 -- pipeline -- its own shadow ray per lit hit, its own row in every pair join,

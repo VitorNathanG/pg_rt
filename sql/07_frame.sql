@@ -13,7 +13,7 @@
 -- already put through exposure, the tone curve and a 1/2.2 gamma, then clipped.
 -- The expensive thing -- radiance -- is gone by that point, so stored pixels
 -- are not a cheaper route to a differently exposed image than re-tracing is.
--- They are only bigger: roughly 100 MB of rows against 6.2 MB of bytea for a
+-- They are only bigger: roughly 100 MB of rows against 419 kB of bytea for a
 -- full HD frame, which is the difference between keeping a frame and keeping a
 -- sequence of them.
 --

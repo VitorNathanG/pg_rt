@@ -3,8 +3,8 @@
 A recursive raytracer that runs entirely inside PostgreSQL and returns a PNG as
 a `bytea`. It renders arbitrary triangular meshes with selectable materials.
 No extensions, no procedural language beyond the two that ship in core, no
-external image library — the PNG container, its checksums and its DEFLATE
-stream are all built in SQL.
+external image library — the PNG container, its checksums, its scanline filters
+and a complete DEFLATE codec in both directions are all built in SQL.
 
 ```sql
 SELECT render(600, 400, 2, 5);                       -- trace into the table `img`
@@ -21,7 +21,7 @@ triangle meshes, and the tracer does not know which is which.
 ```bash
 docker compose up -d      # PostgreSQL 17
 ./load.sh                 # install the engine and build the default scene
-./test.sh                 # 115 checks on the encoders, the geometry and the optics
+./test.sh                 # 147 checks on the codec, the geometry and the optics
 ./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
 
@@ -140,7 +140,7 @@ starts a background job, and `dblink` and `pg_background` are extensions.
 The row stores the PNG rather than the pixels. `img` holds 8-bit values that
 already went through exposure, the tone curve, gamma and clipping, so keeping
 them would not be a cheaper route back to a differently exposed image than
-re-tracing is — only a much larger one: roughly 100 MB of rows against 6.2 MB
+re-tracing is — only a much larger one: roughly 100 MB of rows against 419 kB
 of `bytea` for a full HD frame.
 
 `examples/torus_scene.sql` builds a scene from `examples/torus.obj` — two
@@ -245,17 +245,44 @@ counts, only a slower clock.
 
 ### The PNG is built byte by byte in SQL
 
-PostgreSQL exposes no zlib binding to SQL, so the container is assembled from
-scratch:
+PostgreSQL exposes no zlib binding to SQL, so the container *and the codec* are
+assembled from scratch:
 
 * **CRC-32** for the chunk trailers, from a 256-entry table generated at
   install time by a recursive CTE.
 * **Adler-32** for the zlib trailer. It is a running sum plus a running sum of
   that sum, so it closes into a form with no loop at all —
   `a = 1 + Σb[j]`, `b = n + Σb[j]·(n−j+1)` — evaluated as one aggregate.
-* **DEFLATE** as *stored* (uncompressed) blocks. A stored block is a legal
-  DEFLATE block, so the output is a fully conformant PNG that stock decoders
-  read; it is simply about as large as the raw pixel data.
+* **DEFLATE**, really: LZ77 matching over a hash chain, Huffman code
+  construction, and a bit stream. Every block is costed three ways — stored,
+  fixed Huffman, dynamic Huffman — and the cheapest is the one written, so
+  incompressible input is never inflated and a flat image collapses.
+* **INFLATE**, so a PNG can be read as well as written. Nothing renders with
+  it; it is what a texture would arrive through, and it is what lets the test
+  suite ask whether a PNG is *right* rather than only how long it is.
+* **The five PNG filters.** They compress nothing on their own — each is a
+  reversible prediction from neighbours already sent — but they turn a smooth
+  gradient into a heap of near-zero residuals, which is what gives DEFLATE
+  something skewed enough to code.
+
+A 480×320 frame that was 461 kB of stored blocks is **82 kB**, and the whole
+encode is about 1% of the render that produced it. Sizes land within a couple
+of percent of zlib's on the same input, occasionally under it — the block
+chooser costs all three candidates exactly, where a streaming encoder has to
+decide before it has seen the block.
+
+The filter is chosen by compressing, not by predicting, and that is a departure
+worth flagging. Every PNG encoder picks per scanline using the sum of absolute
+residuals; measured against actually trying each option, that heuristic is
+beaten by a plain fixed filter at every resolution tested, by 5–13%. It ranks
+badly because it measures residual *magnitude* where DEFLATE pays for
+*repetition* — at 480×320 it puts Paeth first and None last by a factor of 44,
+when Sub is smallest and None beats three of the five.
+[`research/deflate.md`](research/deflate.md) has the tables.
+
+The codec is verified against streams a real zlib produced, in both directions,
+because a compressor and a decompressor that share an author will happily agree
+on the same mistake.
 
 ## Performance
 
@@ -271,6 +298,7 @@ obvious approach, which is why they are recorded rather than rediscovered:
 | [`research/inlining.md`](research/inlining.md) | The rule the whole engine rests on, and how to audit it when it silently stops applying |
 | [`research/query-shape.md`](research/query-shape.md) | Joins against loops, CTAS against INSERT, and why JIT is off |
 | [`research/bvh.md`](research/bvh.md) | Leaf sizing, the triangle box, and the level that was rejected |
+| [`research/deflate.md`](research/deflate.md) | Where the bytes live, why the block chooser has to cost the whole block, and what the filters are worth |
 | [`research/timings.md`](research/timings.md) | Per-phase and per-resolution breakdowns, and what a full HD frame costs in bytes |
 
 `render(..., p_verbose => true)` reports each phase as it goes, which is the
@@ -292,13 +320,14 @@ once.
 | file | contents |
 |---|---|
 | `sql/01_vec3.sql` | `vec3` type, operators, reflection and Snell refraction |
-| `sql/02_png.sql` | CRC-32, Adler-32, DEFLATE, PNG chunk framing |
+| `sql/02_deflate.sql` | Adler-32, LZ77, Huffman, DEFLATE and INFLATE |
+| `sql/02_png.sql` | CRC-32, the five scanline filters, PNG chunk framing |
 | `sql/03_mesh.sql` | mesh/material/triangle tables, transforms, intersection, BVH, OBJ loader |
 | `sql/04_scene.sql` | the light table, sky, the default scene |
 | `sql/05_trace.sql` | Fresnel, absorption, direct lighting, ray spawning |
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
 | `sql/07_frame.sql` | the frame table, the render that stores its result, the queue |
-| `test/tests.sql` | 115 checks |
+| `test/tests.sql` | 147 checks |
 | `examples/` | a torus OBJ, the scene that loads it, a camera orbit, a moving scene |
 | [`research/`](research) | the measurements behind the design |
 
@@ -330,8 +359,6 @@ once.
   primary hits against one pose, reflections against another — rather than
   merely stale. A caller that must do both at once should take its snapshot
   explicitly with `BEGIN ISOLATION LEVEL REPEATABLE READ`.
-* Stored DEFLATE blocks mean the PNG is roughly the size of the raw pixels.
-  Implementing real Huffman coding in SQL would fix that.
 * Lights are points, so shadows are hard-edged. An area light is several rows
   sampling one emitter — the renderer already sums them and needs no change —
   but placing those samples well needs a PRNG, and `random()` is `VOLATILE` and
