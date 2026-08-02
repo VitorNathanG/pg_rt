@@ -148,6 +148,12 @@ copies of one OBJ at different sizes and angles, wearing different materials:
 
 ![torus](examples/torus.png)
 
+The same scene at 1920x1080 is
+[`examples/torus_fullhd.png`](examples/torus_fullhd.png). It is 604 kB, and it
+was 6.2 MB until the encoder could compress — the file in the repository is
+that same image put back through `inflate` and re-encoded, not re-rendered, so
+its pixels are the ones the tracer produced.
+
 The OBJ reader handles `v`, `vn` and `f`, polygons of any size
 (fan-triangulated), all of the `1`, `1/2`, `1//3` and `1/2/3` corner
 spellings, and negative (relative) indices. A mesh loaded without normals can
