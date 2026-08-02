@@ -100,3 +100,55 @@ the JIT start firing.
 The penalty is a roughly constant 4.5–5 s per render regardless of resolution —
 `render()` issues a fixed number of distinct queries and each is compiled once
 per execution — so there is no crossover at which it pays back.
+
+## `OFFSET 0` stops a node moving up, not down
+
+The engine leans on `OFFSET 0` throughout to stop the planner pulling a
+subquery up into the join filter, where an inlined expression gets re-evaluated
+at every mention. Per-mesh transforms turned up the other half of that rule,
+and it cost 2x before it was found.
+
+The intersection join has to carry each ray into each mesh's coordinates
+between the mesh-box test and the BVH test. Written the way everything else
+here is written — a fenced `LATERAL` computing twelve products — it measured
+**18 s against 8.9 s** on a 160x120 frame.
+
+The fence worked. The expression was not pulled up and not duplicated. It was
+*pushed down*: the planner placed the node below the `bvh_node` join, so it ran
+once per (ray, mesh, leaf) rather than once per (ray, mesh) — **254 660
+evaluations where 49 000 were needed**. `EXPLAIN ANALYZE` shows it plainly as
+`loops=254660` on a `Result`, which is the only place it is visible; the plan
+shape is otherwise exactly what was intended.
+
+For extra measure the planner wrapped it in a `Memoize` keyed on eighteen
+float8 columns, which scored **zero hits in 49 493 lookups** and held 10 MB.
+Disabling memoize recovered 1.4 s of the 9 s gap, so it was a symptom rather
+than the cause.
+
+**The fix is to materialise, which fixes the count rather than the position.**
+A `WITH ... AS MATERIALIZED` CTE evaluates once and is scanned once:
+
+| | 160x120, 2x2, depth 4 |
+|---|---|
+| fenced `LATERAL` in the join | 18.0 s |
+| `CREATE TEMP TABLE` per bounce | 10.9 s |
+| **`WITH ... AS MATERIALIZED`** | **9.1 s** |
+| no transform at all (baseline) | 8.7 s |
+
+The temp table gets the same single evaluation and then gives it back: creating,
+`ANALYZE`-ing and dropping one per bounce costs about 1.5 s a frame. The CTE has
+no catalog cost and no statistics, and the estimates were good enough here that
+the plan came out the same.
+
+So the three fence lessons are distinct, and the first two do not imply the
+third:
+
+1. An inlined expression named *n* times is evaluated *n* times — fence it.
+2. A fence is not enough when the planner pulls the single-row `Result` up
+   anyway — store the value as a real column.
+3. A fence says nothing about how far *down* the join tree the node may be
+   pushed, and therefore nothing about how many times it runs. Only
+   materialising decides that.
+
+Five percent is what a general affine transform per mesh actually costs, once
+it is evaluated the right number of times.

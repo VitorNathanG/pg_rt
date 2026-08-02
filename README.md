@@ -21,7 +21,7 @@ triangle meshes, and the tracer does not know which is which.
 ```bash
 docker compose up -d      # PostgreSQL 17
 ./load.sh                 # install the engine and build the default scene
-./test.sh                 # 102 checks on the encoders, the geometry and the optics
+./test.sh                 # 115 checks on the encoders, the geometry and the optics
 ./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
 
@@ -43,6 +43,26 @@ is not touched:
 ```sql
 SELECT mesh_set_material('ball', 'crown-glass');
 ```
+
+Changing where something *is* is also an `UPDATE`, of one column:
+
+```sql
+SELECT mesh_place('block', m34_place(1.0, radians(30), ROW(1.35, 0, 0.55)::vec3));
+```
+
+That costs one row, and **no reindex** — `tri` and the BVH come out of an
+animation byte for byte as they went in. The transform is applied to the
+*ray*, carrying it into the mesh's own coordinates rather than carrying the
+mesh into the world's, so nothing the acceleration structure describes can go
+stale when a mesh moves. `examples/spin.sql` animates the default scene over
+twelve frames and checks exactly that.
+
+Two things this has to get right and does: the object-space ray direction is
+deliberately left **unnormalised**, which is what keeps distances, shadow
+lengths and glass thicknesses in world units across the seam; and normals are
+carried by the **inverse transpose**, without which a non-uniformly scaled
+surface gets normals that are no longer perpendicular to it. Both are pinned
+by tests that were checked against a deliberately broken implementation.
 
 A material is a row. `kind` selects the model (diffuse, metal, dielectric) and
 the rest are its parameters, including a per-channel index of refraction, so a
@@ -273,13 +293,13 @@ once.
 |---|---|
 | `sql/01_vec3.sql` | `vec3` type, operators, reflection and Snell refraction |
 | `sql/02_png.sql` | CRC-32, Adler-32, DEFLATE, PNG chunk framing |
-| `sql/03_mesh.sql` | mesh/material/triangle tables, intersection, BVH, OBJ loader |
+| `sql/03_mesh.sql` | mesh/material/triangle tables, transforms, intersection, BVH, OBJ loader |
 | `sql/04_scene.sql` | the light table, sky, the default scene |
 | `sql/05_trace.sql` | Fresnel, absorption, direct lighting, ray spawning |
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
 | `sql/07_frame.sql` | the frame table, the render that stores its result, the queue |
-| `test/tests.sql` | 102 checks |
-| `examples/` | a torus OBJ, the scene that loads it, and a camera orbit |
+| `test/tests.sql` | 115 checks |
+| `examples/` | a torus OBJ, the scene that loads it, a camera orbit, a moving scene |
 | [`research/`](research) | the measurements behind the design |
 
 ## Notes and limitations
@@ -291,9 +311,25 @@ once.
   what a scene of 100k triangles would need.
 * `scene_reindex()` must be called after changing geometry. New triangles have
   no BVH leaf until it runs, and the renderer will not see them.
-* Placement is scale, pitch and yaw. That is enough to aim a mesh but not to
-  shear or mirror one; a real 4×4 transform would need a type and an
-  inverse-transpose for the normals.
+* Vertex *baking* is still scale, pitch and yaw only, so building a sheared
+  mesh needs `mesh.xform` rather than `mesh_load_obj`'s arguments. The
+  transform itself is a general affine map and handles both.
+* A frame records the camera it was taken from but not the scene it was
+  pointed at, so a **geometry** animation cannot be queued the way a camera
+  move can. It has to interleave the `UPDATE` with the render, which means one
+  session and strict order — `examples/spin.sql` does not use
+  `render_frames.sh`, while `examples/orbit.sql` can, and pays about 4× in wall
+  clock for it.
+
+  Worth knowing precisely, because the failure is not just "the wrong pose":
+  `render()` is a `VOLATILE` function and each statement in it takes a fresh
+  snapshot under `READ COMMITTED`, so a pose committed by another session
+  part-way through is visible to *later bounces of a render already running*.
+  Measured directly: two reads of `mesh.xform` in one function call returned
+  0 and then 99. A frame can therefore come out internally inconsistent —
+  primary hits against one pose, reflections against another — rather than
+  merely stale. A caller that must do both at once should take its snapshot
+  explicitly with `BEGIN ISOLATION LEVEL REPEATABLE READ`.
 * Stored DEFLATE blocks mean the PNG is roughly the size of the raw pixels.
   Implementing real Huffman coding in SQL would fix that.
 * Lights are points, so shadows are hard-edged. An area light is several rows

@@ -286,11 +286,22 @@ SELECT ok(bool_and((v).x >= (n.lo).x - 1e-9 AND (v).x <= (n.hi).x + 1e-9
 FROM tri t JOIN bvh_node n ON n.cl = t.cl,
      LATERAL (SELECT unnest(ARRAY[t.a, t.b, t.c])) AS q(v);
 
-SELECT ok(bool_and((n.lo).x >= (mb.lo).x - 1e-9 AND (n.hi).x <= (mb.hi).x + 1e-9
-               AND (n.lo).y >= (mb.lo).y - 1e-9 AND (n.hi).y <= (mb.hi).y + 1e-9
-               AND (n.lo).z >= (mb.lo).z - 1e-9 AND (n.hi).z <= (mb.hi).z + 1e-9),
+-- Across a coordinate change, so the corners are transformed before they are
+-- compared: leaf boxes are in the mesh's own space and the mesh box is in the
+-- world.  Written naively this passes for the wrong reason whenever every
+-- transform happens to be the identity, and starts failing the moment one is
+-- not -- which is exactly when it would be worth having.
+SELECT ok(bool_and((w).x >= (mb.lo).x - 1e-9 AND (w).x <= (mb.hi).x + 1e-9
+               AND (w).y >= (mb.lo).y - 1e-9 AND (w).y <= (mb.hi).y + 1e-9
+               AND (w).z >= (mb.lo).z - 1e-9 AND (w).z <= (mb.hi).z + 1e-9),
           'every leaf box lies inside its mesh box')
-FROM bvh_node n JOIN mesh_box mb USING (mesh_id);
+FROM bvh_node n
+     JOIN mesh_box mb USING (mesh_id)
+     JOIN mesh m USING (mesh_id),
+     LATERAL (SELECT m34_point(m.xform, cx.x, cy.y, cz.z)
+              FROM (VALUES ((n.lo).x), ((n.hi).x)) AS cx(x),
+                   (VALUES ((n.lo).y), ((n.hi).y)) AS cy(y),
+                   (VALUES ((n.lo).z), ((n.hi).z)) AS cz(z)) AS corner(w);
 
 SELECT ok(count(*) = 0, 'every triangle is assigned to a leaf')
 FROM tri WHERE cl IS NULL;
@@ -308,8 +319,15 @@ FROM (
 -- material flag rather than on the distance.
 LATERAL (SELECT CASE WHEN (z.h).mat = 0 THEN -1 ELSE (z.h).t END
          FROM (SELECT scene_hit(v3(0.55,2.35,6.70), r.d)) AS z(h)) AS f(fast),
-LATERAL (SELECT coalesce(min(x.t), -1) FROM tri t,
-         LATERAL (SELECT tri_hit(v3(0.55,2.35,6.70), r.d, t.a, t.b, t.c)) AS x(t)
+-- The brute-force side transforms the ray per mesh too.  It has to: without
+-- it this would compare an accelerated hit that respects mesh.xform against a
+-- scan that does not, and the check would fail on any moved scene while the
+-- renderer was perfectly correct.
+LATERAL (SELECT coalesce(min(x.t), -1)
+         FROM tri t
+              JOIN mesh m USING (mesh_id)
+              CROSS JOIN LATERAL m34_ray(m, v3(0.55,2.35,6.70), r.d) AS o,
+              LATERAL (SELECT tri_hit(o.oo, o.od, t.a, t.b, t.c)) AS x(t)
          WHERE x.t IS NOT NULL) AS s(brute);
 
 -- Rebuilding the index must be idempotent, or repeated edits drift.
@@ -323,6 +341,179 @@ SELECT ok(bool_and(v3_dot(d, (scene_hit(v3(0.55,2.35,6.70), d)).n) <= 1e-12),
           'the returned normal always faces the incoming ray')
 FROM (SELECT v3_unit(v3(gx.i / 6.0 - 1.0, gy.j / 6.0 - 0.55, -1))
       FROM generate_series(0,12) gx(i), generate_series(0,12) gy(j)) AS q(d);
+
+\echo
+\echo == transforms ==
+
+SELECT ok(m34_inverse(m34_identity()) = m34_identity(),
+          'the identity transform inverts to itself');
+
+-- A transform composed with its own inverse has to be the identity map, and
+-- checking it on points rather than on the matrix is what catches the affine
+-- mistake: inverting the linear part and negating the translation separately
+-- looks right and is wrong, because the translation has to go through the
+-- inverted linear part as well.
+SELECT ok(bool_and(near((rt).x, (p).x, 1e-12)
+              AND near((rt).y, (p).y, 1e-12)
+              AND near((rt).z, (p).z, 1e-12)),
+          'a transform composed with its inverse is the identity on points')
+FROM (VALUES (v3(1,2,3)), (v3(-4,0.5,7)), (v3(0,0,0))) AS q(p),
+     (VALUES (m34_place(2.0, 0.7, v3(3,-1,4))),
+             (m34_scale(0.5, 3.0, 2.0, v3(-2,1,0)))) AS x(m),
+     LATERAL (SELECT m34_point(m34_inverse(x.m), (f).x, (f).y, (f).z)
+              FROM (SELECT m34_point(x.m, (q.p).x, (q.p).y, (q.p).z)) AS s(f))
+       AS r(rt);
+
+-- A mesh scaled to nothing has no object space to carry a ray into, and the
+-- failure is far easier to read here than as a frame full of NaN.
+SELECT ok(raises($$SELECT m34_inverse(m34_scale(1.0, 0.0, 1.0, v3(0,0,0)))$$),
+          'a singular transform is refused rather than returning infinities');
+
+-- make_hit normalises the transformed normal itself, so it takes the raw one.
+-- If these two ever disagree in direction the renderer and every other caller
+-- are shading different surfaces.
+SELECT ok(bool_and(near(v3_len(tri_shading_normal(t, bc)
+                              - v3_unit(tri_shading_normal_raw(t, bc))), 0.0, 1e-12)),
+          'the raw shading normal points where the normalised one does')
+FROM tri t, (VALUES (v3(0.2,0.3,0.5)), (v3(0.7,0.2,0.1))) AS q(bc)
+WHERE t.na IS NOT NULL;
+
+-- The claim that makes this feature worth having: a move is one row.  If
+-- either of these changed, an animation would be paying to rebuild the
+-- acceleration structure at every frame, which is the thing being avoided.
+CREATE TEMP TABLE geom_before AS
+SELECT (SELECT count(*) FROM tri) AS ntri,
+       (SELECT md5(string_agg(tri_id || ':' || cl || ':' || ax || ',' || ay || ',' || az,
+                              ',' ORDER BY tri_id)) FROM tri) AS trihash,
+       (SELECT md5(string_agg(cl || ':' || lox || ',' || hiz, ',' ORDER BY cl))
+          FROM bvh_node) AS bvhhash,
+       (SELECT (mb.lo).y FROM mesh_box mb JOIN mesh m USING (mesh_id)
+         WHERE m.name = 'ball') AS ball_lo_y;
+
+SELECT mesh_place('ball', m34_place(1.0, 0.0, v3(0, 0.5, 0)));
+
+SELECT ok((SELECT md5(string_agg(tri_id || ':' || cl || ':' || ax || ',' || ay || ',' || az,
+                                 ',' ORDER BY tri_id)) FROM tri) = trihash
+      AND (SELECT count(*) FROM tri) = ntri,
+          'moving a mesh rewrites no triangle')
+FROM geom_before;
+
+SELECT ok((SELECT md5(string_agg(cl || ':' || lox || ',' || hiz, ',' ORDER BY cl))
+             FROM bvh_node) = bvhhash,
+          'moving a mesh rebuilds no BVH node')
+FROM geom_before;
+
+-- ... and the one thing it must change, or the mesh gets culled against where
+-- it used to be and vanishes with nothing to say so.
+SELECT ok(near((SELECT (mb.lo).y FROM mesh_box mb JOIN mesh m USING (mesh_id)
+                 WHERE m.name = 'ball'), ball_lo_y + 0.5, 1e-12),
+          'moving a mesh moves its world box, without a reindex')
+FROM geom_before;
+
+-- Against the ground truth: a mesh moved by transform must be in the same
+-- place as a mesh whose vertices were built there.  Distances agree to about
+-- one ULP, which is what says the transform is exact rather than merely close.
+SELECT ok(near((scene_hit(v3(-1.15, 1.5, 6.0), v3(0,0,-1))).t, 5.2, 1e-9),
+          'a translated mesh is hit where the translation says it is');
+
+SELECT mesh_place('ball', m34_identity());
+
+-- Non-uniform scale is the case that separates a correct normal from a
+-- plausible one.  Under a scale of (1, 3, 1) the surface tilts one way and a
+-- normal carried by the transform itself tilts the other; only the inverse
+-- transpose stays perpendicular.  Checked against the transformed triangle's
+-- own geometric normal, which is ground truth by construction.
+SELECT ok(bool_and(near(abs(v3_dot(v3_unit(nt), v3_unit(ng))), 1.0, 1e-9)),
+          'a normal under non-uniform scale rides the inverse transpose')
+FROM (SELECT m34_scale(1.0, 3.0, 1.0, v3(0,0,0)) AS m) AS x,
+     LATERAL (SELECT m34_inverse(x.m) AS im) AS y,
+     (VALUES (v3(0,0,0), v3(1,0,0), v3(0,1,0)),
+             (v3(1,2,3), v3(0,1,1), v3(2,0,1)),
+             (v3(-1,0.5,2), v3(1,1,0), v3(0,2,1))) AS t(a, b, c),
+     -- the object-space facet normal, put through the inverse transpose
+     LATERAL (SELECT tri_normal(t.a, t.b, t.c)) AS o(n),
+     LATERAL (SELECT v3((y.im).xx * (o.n).x + (y.im).yx * (o.n).y + (y.im).zx * (o.n).z,
+                        (y.im).xy * (o.n).x + (y.im).yy * (o.n).y + (y.im).zy * (o.n).z,
+                        (y.im).xz * (o.n).x + (y.im).yz * (o.n).y + (y.im).zz * (o.n).z))
+       AS p(nt),
+     -- and the facet normal of the triangle after it has actually been moved
+     LATERAL (SELECT tri_normal(m34_point(x.m, (t.a).x, (t.a).y, (t.a).z),
+                                m34_point(x.m, (t.b).x, (t.b).y, (t.b).z),
+                                m34_point(x.m, (t.c).x, (t.c).y, (t.c).z))) AS g(ng);
+
+-- Leaving the object-space direction unnormalised is what keeps `t` meaning
+-- world distance on both sides of the transform.  Normalise it and a mesh
+-- scaled by 2 reports half the distance to itself -- which would not look
+-- wrong, it would just put every shadow and every glass thickness in the
+-- wrong units.
+SELECT mesh_place('ball', m34_scale(2.0, 2.0, 2.0, v3(0,0,0)));
+SELECT scene_reindex();
+SELECT ok(near((scene_hit(v3(-2.30, 2.0, 6.0), v3(0,0,-1))).t, 6.0 - (-0.4 + 2.0), 1e-6),
+          'ray distance stays in world units through a scaled mesh');
+SELECT mesh_place('ball', m34_identity());
+SELECT scene_reindex();
+DROP TABLE geom_before;
+
+-- The above proves m34_inverse transposes correctly.  It does not prove the
+-- *renderer* uses it, and that gap is not hypothetical: make_hit rebuilt to
+-- carry the normal through mesh.xform instead of through the inverse passes
+-- every other check in this file, because every mesh in the default scene is
+-- at the identity where the two agree exactly.
+--
+-- So this fires a real ray at a real mesh whose transform tells the two
+-- apart.  One triangle with corners at (0,0,0), (1,0,0) and (0,1,1) has an
+-- object-space normal along (0,-1,1); scaled by three in y its surface tilts
+-- to (0,-1,3) normalised, while the same normal pushed through the transform
+-- would come back as (0,-3,1) normalised.  Those are 71 degrees apart, so a
+-- renderer that confuses them is not subtly wrong.
+SELECT scene_clear();
+SELECT mesh_load_obj('tilt', 'chrome', E'v 0 0 0\nv 1 0 0\nv 0 1 1\nf 1 2 3\n');
+SELECT scene_reindex();
+SELECT mesh_place('tilt', m34_scale(1.0, 3.0, 1.0, v3(0,0,0)));
+
+SELECT ok((q.h).mat <> 0
+      AND near(((q.h).n).x, 0.0,               1e-9)
+      AND near(((q.h).n).y, -1.0 / sqrt(10.0), 1e-9)
+      AND near(((q.h).n).z,  3.0 / sqrt(10.0), 1e-9),
+          'the tracer transforms normals by the inverse transpose')
+FROM (SELECT scene_hit(v3(1.0/3.0, 1.0, 10.0), v3(0,0,-1))) AS q(h);
+
+-- and the hit itself must be on the transformed surface, not the original
+SELECT ok(near((scene_hit(v3(1.0/3.0, 1.0, 10.0), v3(0,0,-1))).t, 10.0 - 1.0/3.0, 1e-9),
+          'a non-uniformly scaled surface is hit where the scale puts it');
+
+-- Both checks above go through scene_hit(), which carries its own copy of the
+-- transform.  The renderer's copy is spelled out inline over flat columns and
+-- is the one that actually draws the picture, so it needs its own check --
+-- normalising the object-space direction there breaks every distance in the
+-- frame and passes everything else in this file.
+--
+-- The comparison is exact rather than approximate, which is available only
+-- because the scale is 2.0: a power of two moves the exponent and leaves every
+-- mantissa alone, so a sphere built at radius 2 and a sphere built at radius 1
+-- and scaled are the same numbers, not merely close ones.  Any other factor
+-- would need a tolerance and would test less.
+SELECT scene_clear();
+SELECT mesh_add_quad('ground', 'checker-tile', 40.0);
+SELECT mesh_add_sphere('ball', 'checker-tile', 2.00, v3(0, 2.0, 0), 16);
+SELECT scene_reindex();
+SELECT render(48, 32, 1, 2);
+CREATE TEMP TABLE scaled_baked AS SELECT * FROM img;
+
+SELECT scene_clear();
+SELECT mesh_add_quad('ground', 'checker-tile', 40.0);
+SELECT mesh_add_sphere('ball', 'checker-tile', 1.00, v3(0, 1.0, 0), 16);
+SELECT scene_reindex();
+SELECT mesh_place('ball', m34_scale(2.0, 2.0, 2.0, v3(0,0,0)));
+SELECT render(48, 32, 1, 2);
+
+SELECT ok(count(*) = 0, 'the renderer draws a scaled mesh exactly as a built one')
+FROM img i JOIN scaled_baked b USING (x, y)
+WHERE (i.r, i.g, i.b) IS DISTINCT FROM (b.r, b.g, b.b);
+
+DROP TABLE scaled_baked;
+SELECT scene_clear();
+SELECT scene_default();
 
 \echo
 \echo == optics ==

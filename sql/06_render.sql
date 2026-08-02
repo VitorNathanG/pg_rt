@@ -236,29 +236,75 @@ BEGIN
     -- triangles, the triangle's own box rejects the triangle, and only what
     -- survives all three reaches tri_hit.
     IF dep > 0 THEN            -- nothing to clear on the first pass, and
-      DROP TABLE rt_new;       -- IF EXISTS would only be a NOTICE per render
+      DROP TABLE rt_new;       -- IF EXISTS would only be a NOTICE
     END IF;
+
+    -- The world/object boundary, materialised.
+    --
+    -- The mesh box is the last thing tested in world coordinates; everything
+    -- below it -- leaf box, triangle box, triangle -- is tested against the
+    -- ray carried into that mesh's own space, which is why a mesh can move
+    -- without touching bvh_node or tri.  They never knew where it was.
+    --
+    -- `AS MATERIALIZED` is doing the work of the whole feature's performance,
+    -- and it is a third distinct lesson about fences rather than a repeat of
+    -- the other two.  Written as a fenced LATERAL inside the join below, the
+    -- transform lands *underneath* the bvh_node join and is re-executed per
+    -- leaf rather than per mesh: 254 660 evaluations of twelve multiplies
+    -- where 49 000 were needed, wrapped for good measure in a Memoize scoring
+    -- zero hits on an eighteen-column key.  18 s against 8.9 s.
+    --
+    -- OFFSET 0 stops an expression being pulled *up*; it says nothing about
+    -- how far *down* the node it guards may be pushed, and it is the second of
+    -- those that bites here.
+    --
+    -- A real TEMP table fixes it too and was measured -- 10.9 s, because
+    -- creating, analysing and dropping one per bounce costs about 1.5 s a
+    -- frame.  The CTE gets the same single evaluation with none of that.
+    --
+    -- One row per (ray, mesh) pair the mesh box admits, so it is bounded by
+    -- the ray count times the mesh count and in practice far below that.
     CREATE TEMP TABLE rt_new AS
-    WITH best AS (
-      SELECT r.rid, nearest(ROW(x.t, t.tri_id)::cand) AS c
+    WITH mray AS MATERIALIZED (
+      SELECT r.rid, mb.mesh_id, q.ox, q.oy, q.oz, q.dx, q.dy, q.dz,
+             1.0 / nz(q.dx) AS ivx, 1.0 / nz(q.dy) AS ivy, 1.0 / nz(q.dz) AS ivz
       FROM rt_ray r
            JOIN mesh_box mb ON box_hit(r.ox, r.oy, r.oz, r.ivx, r.ivy, r.ivz,
                                        mb.lox, mb.loy, mb.loz,
                                        mb.hix, mb.hiy, mb.hiz)
-           JOIN bvh_node n  ON n.mesh_id = mb.mesh_id
-                           AND box_hit(r.ox, r.oy, r.oz, r.ivx, r.ivy, r.ivz,
+           JOIN mesh ms     ON ms.mesh_id = mb.mesh_id
+           CROSS JOIN LATERAL (
+             SELECT ms.ixx * r.ox + ms.ixy * r.oy + ms.ixz * r.oz + ms.itx,
+                    ms.iyx * r.ox + ms.iyy * r.oy + ms.iyz * r.oz + ms.ity,
+                    ms.izx * r.ox + ms.izy * r.oy + ms.izz * r.oz + ms.itz,
+                    ms.ixx * r.dx + ms.ixy * r.dy + ms.ixz * r.dz,
+                    ms.iyx * r.dx + ms.iyy * r.dy + ms.iyz * r.dz,
+                    ms.izx * r.dx + ms.izy * r.dy + ms.izz * r.dz
+             OFFSET 0) AS q(ox, oy, oz, dx, dy, dz)
+    ),
+    best AS (
+      SELECT mr.rid, nearest(ROW(x.t, t.tri_id)::cand) AS c
+      FROM mray mr
+           JOIN bvh_node n  ON n.mesh_id = mr.mesh_id
+                           AND box_hit(mr.ox, mr.oy, mr.oz,
+                                       mr.ivx, mr.ivy, mr.ivz,
                                        n.lox, n.loy, n.loz, n.hix, n.hiy, n.hiz)
            JOIN tri t       ON t.cl = n.cl
-                           AND box_hit(r.ox, r.oy, r.oz, r.ivx, r.ivy, r.ivz,
+                           AND box_hit(mr.ox, mr.oy, mr.oz,
+                                       mr.ivx, mr.ivy, mr.ivz,
                                        t.lox, t.loy, t.loz, t.hix, t.hiy, t.hiz)
            CROSS JOIN LATERAL (
-             SELECT tri_hit(r.ox, r.oy, r.oz, r.dx, r.dy, r.dz,
+             SELECT tri_hit(mr.ox, mr.oy, mr.oz, mr.dx, mr.dy, mr.dz,
                             t.ax, t.ay, t.az, t.e1x, t.e1y, t.e1z,
                             t.e2x, t.e2y, t.e2z, t.gnx, t.gny, t.gnz)
              OFFSET 0) AS x(t)
       WHERE x.t IS NOT NULL
-      GROUP BY r.rid
+      GROUP BY mr.rid
     )
+    -- The winner is re-transformed rather than carried through the aggregate:
+    -- `nearest` reduces to one row per ray, so this runs once per ray instead
+    -- of once per candidate, and a cand wide enough to hold a ray would have
+    -- cost more in the aggregate than the six multiplies cost here.
     SELECT r.px, r.py, r.d, r.att * beer(hh.h, m) AS att, r.chan, hh.h
     FROM rt_ray r
          LEFT JOIN best b   ON b.rid = r.rid
@@ -266,7 +312,14 @@ BEGIN
          LEFT JOIN mesh ms  ON ms.mesh_id = t.mesh_id
          LEFT JOIN material m ON m.mat_id = ms.mat_id
          CROSS JOIN LATERAL (
-           SELECT make_hit(r.o, r.d, b.c, t, coalesce(m.mat_id, 0)) OFFSET 0) AS hh(h);
+           SELECT CASE WHEN ms.mesh_id IS NULL THEN r.o
+                       ELSE (m34_ray(ms, r.o, r.d)).oo END,
+                  CASE WHEN ms.mesh_id IS NULL THEN r.d
+                       ELSE (m34_ray(ms, r.o, r.d)).od END
+           OFFSET 0) AS orr(oo, od)
+         CROSS JOIN LATERAL (
+           SELECT make_hit(r.o, r.d, orr.oo, orr.od, b.c, t, ms,
+                           coalesce(m.mat_id, 0)) OFFSET 0) AS hh(h);
     ANALYZE rt_new;
 
     -- rt_new keeps its records: it is rebuilt every bounce, and child_ray
@@ -349,29 +402,50 @@ BEGIN
   -- thickness actually traversed, which for a closed mesh is the span between
   -- the ray's first and last crossing of it.  Not a real caustic, but it
   -- keeps glass from casting the flat black hole a binary test would give it.
+  -- Shadow rays cross the same world/object boundary as camera rays, and are
+  -- materialised at it for the same measured reason -- see `mray` above.  It
+  -- is worth even more here: 2.5 s of shadow phase against 1.1 s.
+  --
+  -- `dist` is carried across so the "did something block it before the light"
+  -- test can stay below, and it is comparable to an object-space `t` only
+  -- because the direction was not normalised on the way in.
   CREATE TEMP TABLE rt_shadow AS
-  WITH blocker AS (
-    SELECT s.hid, s.light_id, n.mesh_id, mm.kind, mm.absorb,
+  WITH smray AS MATERIALIZED (
+      SELECT s.hid, s.light_id, s.dist, mb.mesh_id, ms.mat_id,
+             q.ox, q.oy, q.oz, q.dx, q.dy, q.dz,
+             1.0 / nz(q.dx) AS ivx, 1.0 / nz(q.dy) AS ivy, 1.0 / nz(q.dz) AS ivz
+      FROM rt_sray s
+           JOIN mesh_box mb ON box_hit(s.ox, s.oy, s.oz, s.ivx, s.ivy, s.ivz,
+                                       mb.lox, mb.loy, mb.loz,
+                                       mb.hix, mb.hiy, mb.hiz)
+           JOIN mesh ms     ON ms.mesh_id = mb.mesh_id
+           CROSS JOIN LATERAL (
+             SELECT ms.ixx * s.ox + ms.ixy * s.oy + ms.ixz * s.oz + ms.itx,
+                    ms.iyx * s.ox + ms.iyy * s.oy + ms.iyz * s.oz + ms.ity,
+                    ms.izx * s.ox + ms.izy * s.oy + ms.izz * s.oz + ms.itz,
+                    ms.ixx * s.dx + ms.ixy * s.dy + ms.ixz * s.dz,
+                    ms.iyx * s.dx + ms.iyy * s.dy + ms.iyz * s.dz,
+                    ms.izx * s.dx + ms.izy * s.dy + ms.izz * s.dz
+             OFFSET 0) AS q(ox, oy, oz, dx, dy, dz)
+  ),
+  blocker AS (
+    SELECT s.hid, s.light_id, s.mesh_id, mm.kind, mm.absorb,
            min(x.t) AS t0, max(x.t) AS t1
-    FROM rt_sray s
-         JOIN mesh_box mb ON box_hit(s.ox, s.oy, s.oz, s.ivx, s.ivy, s.ivz,
-                                     mb.lox, mb.loy, mb.loz,
-                                     mb.hix, mb.hiy, mb.hiz)
-         JOIN bvh_node n  ON n.mesh_id = mb.mesh_id
+    FROM smray s
+         JOIN bvh_node n  ON n.mesh_id = s.mesh_id
                          AND box_hit(s.ox, s.oy, s.oz, s.ivx, s.ivy, s.ivz,
                                      n.lox, n.loy, n.loz, n.hix, n.hiy, n.hiz)
          JOIN tri t       ON t.cl = n.cl
                          AND box_hit(s.ox, s.oy, s.oz, s.ivx, s.ivy, s.ivz,
                                      t.lox, t.loy, t.loz, t.hix, t.hiy, t.hiz)
-         JOIN mesh ms     ON ms.mesh_id = n.mesh_id
-         JOIN material mm ON mm.mat_id = ms.mat_id
+         JOIN material mm ON mm.mat_id = s.mat_id
          CROSS JOIN LATERAL (
            SELECT tri_hit(s.ox, s.oy, s.oz, s.dx, s.dy, s.dz,
                           t.ax, t.ay, t.az, t.e1x, t.e1y, t.e1z,
                           t.e2x, t.e2y, t.e2z, t.gnx, t.gny, t.gnz)
            OFFSET 0) AS x(t)
     WHERE x.t IS NOT NULL AND x.t < s.dist
-    GROUP BY s.hid, s.light_id, n.mesh_id, mm.kind, mm.absorb
+    GROUP BY s.hid, s.light_id, s.mesh_id, mm.kind, mm.absorb
   )
   SELECT hid, light_id,
          CASE WHEN bool_or(kind <> mat_glass()) THEN ROW(0, 0, 0)::vec3

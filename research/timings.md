@@ -215,3 +215,45 @@ to remove, moved one level down and visible only in `pg_locks`.
 It is fixable — elect one sweeper with an advisory lock, add a `lock_timeout`
 so no sweep ever waits — and the fix works. It is about fifty lines, it leaks a
 schema per crashed session, and it buys nine percent.
+
+### What instancing would and would not buy
+
+There is no instancing: `tri.mesh_id` means a mesh *is* its triangles, so N
+copies of one object are N copies of its geometry. Measured by duplicating the
+default scene's 1104-triangle ball seven times, each at its own transform:
+
+| | 1 ball | 8 balls |
+|---|---|---|
+| rows in `tri` | 1 118 | 8 846 |
+| `tri` on disk | 1 240 kB | 9 864 kB |
+| `scene_reindex()` | 30 ms | 148 ms |
+| render, 160x120 depth 3 | 3 496 ms | 4 263 ms |
+
+**Storage went up 8x and reindexing 5x, and the render went up 22%** — and that
+last number is the interesting one, because it is the number instancing would
+*not* improve. A ray still has to be carried into each instance's coordinates
+and still has to walk a BVH per instance; sharing the triangles behind those
+instances changes what is in the buffer cache, not how many box tests run. The
+22% is the eight mesh boxes and eight traversals, and it would be paid either
+way.
+
+So instancing here is a memory and build-time feature, not a rendering one, and
+that is what sizes its urgency: at ~1.14 kB per triangle, two hundred instances
+of a 10k-triangle tree is 2.3 GB of `tri` and a reindex over two million rows
+every time anything is added, against 11 MB and 10 000 rows if the geometry
+were shared. It is the difference between a scene fitting and not, rather than
+between a frame being fast and slow.
+
+### A pose can change under a render that is already running
+
+`render()` is `VOLATILE` and PL/pgSQL takes a fresh snapshot per statement
+under `READ COMMITTED`, so `mesh.xform` is re-read at every bounce. Two reads
+inside a single function call, with another session committing between them,
+returned **0 and then 99**.
+
+The consequence is specific: a geometry animation that overlapped a render
+would not produce a frame of the wrong pose, it would produce a frame with its
+primary hits at one pose and its reflections and shadows at another, silently.
+This is why `examples/spin.sql` is strictly serial while `examples/orbit.sql`
+can use the queue — a camera lives on the frame row and cannot change under
+the render that is reading it, and geometry, for now, can.
