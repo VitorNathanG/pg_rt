@@ -182,6 +182,22 @@ BEGIN
     hx   float8, hy float8, hz float8,      -- point,
     nx   float8, ny float8, nz float8);     -- and shading normal
 
+  -- Where a pixel is accumulated, in radiance and before the tone curve.
+  --
+  -- The shading pass used to divide by aa*aa and quantize in the same
+  -- statement, which quietly asserted two things: that every pixel got the
+  -- same number of samples, and that a pixel is finished the first time it is
+  -- looked at.  Neither is a property of the renderer, only of the sampling
+  -- pattern it happens to use, and both are exactly what a scheme that spends
+  -- more samples on some pixels than others has to stop assuming.
+  --
+  -- Splitting them costs one table and buys the tone curve a single, final
+  -- position.  That matters more than the count does: sRGB is not a linear
+  -- space, so averaging quantized bytes is not averaging light, and it goes
+  -- wrong precisely at the high-contrast edges that any extra sample would be
+  -- aimed at.  Radiance stays linear here and is quantized once, at the end.
+  CREATE TEMP TABLE img_acc (px int, py int, n int, r float8, g float8, b float8);
+
   -- Every ray set is built with CREATE TABLE AS rather than INSERT INTO, which
   -- was once worth about 9%: PostgreSQL refuses to parallelise any statement
   -- that writes and CTAS is the one exception, so the identical query got a
@@ -227,6 +243,15 @@ BEGIN
                                cu, cv, cw, cth)
                 OFFSET 0) AS cr(dir);
   ANALYZE rt_ray;
+
+  -- How many samples each pixel actually got, counted rather than assumed.
+  -- Taken here because the bounce loop rebuilds rt_ray with the children and
+  -- the camera rays are gone after the first pass; this is the last moment the
+  -- sample population exists.  One aggregate over the ray table, against a
+  -- bounce loop that will join the same rows against the BVH many times over.
+  CREATE TEMP TABLE rt_spp AS
+  SELECT px, py, count(*)::int AS n FROM rt_ray GROUP BY px, py;
+  ANALYZE rt_spp;
 
   FOR dep IN 0 .. maxdepth LOOP
     ts := clock_timestamp();
@@ -504,19 +529,21 @@ BEGIN
     ts := clock_timestamp();
   END IF;
 
-  INSERT INTO img (x, y, r, g, b)
-  SELECT px, py,
-         quantize((col).x, exposure),
-         quantize((col).y, exposure),
-         quantize((col).z, exposure)
-  FROM (
+  -- Radiance per pixel, carrying the sample count that produced it.  The join
+  -- is from rt_spp outwards so that a pixel is recorded as having been sampled
+  -- even if nothing it fired came back with anything to shade -- which cannot
+  -- happen today, since a ray that hits nothing still lands in rt_hit as a sky
+  -- row, but it is the direction that fails safe if that ever stops holding.
+  INSERT INTO img_acc (px, py, n, r, g, b)
+  SELECT s.px, s.py, s.n,
+         coalesce(q.sr, 0), coalesce(q.sg, 0), coalesce(q.sb, 0)
+  FROM rt_spp s
+       LEFT JOIN (
     -- Component sums again, for the reason given at rt_rad -- worth 1.43x
     -- here.  shade() is bound once in the LATERAL rather than named three
     -- times inside the sums, which would call it three times per row and cost
     -- far more than the aggregate ever did.
-    SELECT h.px, h.py,
-           ROW(sum((sh.c).x), sum((sh.c).y), sum((sh.c).z))::vec3
-             * (1.0 / (aa * aa)) AS col
+    SELECT h.px, h.py, sum((sh.c).x), sum((sh.c).y), sum((sh.c).z)
     FROM rt_hit h
          LEFT JOIN material m ON m.mat_id = h.mat
          LEFT JOIN rt_rad e   ON e.hid = h.hid
@@ -528,14 +555,32 @@ BEGIN
                         coalesce(e.rad, ROW(0,0,0)::vec3))
            OFFSET 0) AS sh(c)
     GROUP BY h.px, h.py
-  ) AS q;
+  ) AS q(px, py, sr, sg, sb) ON q.px = s.px AND q.py = s.py;
+
+  -- The tone curve, once, over whatever accumulated.  Dividing by the summed
+  -- count rather than multiplying by a precomputed reciprocal is also the more
+  -- accurate of the two, since 1/(aa*aa) is exact only when aa is a power of
+  -- two -- but only in principle: at aa = 3 the frame came back identical
+  -- anyway, because a difference of one ulp has to cross an 8-bit rounding
+  -- boundary before it can reach a pixel.
+  --
+  -- The whole split costs about 1.6% of a frame (11.7 s against 11.5 s at
+  -- 400x260), which is one aggregate over the ray table and one pass over a
+  -- row per pixel.
+  INSERT INTO img (x, y, r, g, b)
+  SELECT px, py,
+         quantize(sum(r) / sum(n), exposure),
+         quantize(sum(g) / sum(n), exposure),
+         quantize(sum(b) / sum(n), exposure)
+  FROM img_acc
+  GROUP BY px, py;
 
   IF p_verbose THEN
     RAISE NOTICE 'shading  : % ms',
       round(extract(epoch FROM clock_timestamp() - ts)::numeric * 1000);
   END IF;
 
-  DROP TABLE rt_ray, rt_new, rt_hit, rt_sray, rt_shadow, rt_rad;
+  DROP TABLE rt_ray, rt_new, rt_hit, rt_sray, rt_shadow, rt_rad, rt_spp, img_acc;
 END $$ LANGUAGE plpgsql;
 
 -- Convenience wrapper: render and hand back the encoded PNG in one call.
