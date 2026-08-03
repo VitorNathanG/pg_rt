@@ -443,6 +443,13 @@ BEGIN
     -- in question could actually show on.  The pair, not the hit, is the unit of
     -- work from here down: a scene with three lights fires three shadow rays at
     -- an open floor and none at all at a wall facing away from all three.
+    --
+    -- `sp` is the point on the light this ray is aimed at, and it is *stored*
+    -- rather than recomputed downstream.  It is read on both sides of a
+    -- dependency -- the ray is traced toward it, and the shading is then
+    -- evaluated from it -- so a renderer that derived it twice would be relying
+    -- on two reads of one column agreeing.  Today they always do, because a
+    -- light is a point and there is only one place to aim at.
     ts := clock_timestamp();
     CREATE TEMP TABLE rt_sray AS
     SELECT h.hid, l.light_id,
@@ -451,12 +458,15 @@ BEGIN
            h.hz + h.nz * 1e-3 AS oz,
            sl.ldx AS dx, sl.ldy AS dy, sl.ldz AS dz,
            1.0 / nz(sl.ldx) AS ivx, 1.0 / nz(sl.ldy) AS ivy,
-           1.0 / nz(sl.ldz) AS ivz, dd.dist
+           1.0 / nz(sl.ldz) AS ivz, dd.dist,
+           sp.px AS lpx, sp.py AS lpy, sp.pz AS lpz
     FROM rt_hit h
          JOIN material m ON m.mat_id = h.mat
          CROSS JOIN light l
-         CROSS JOIN LATERAL (SELECT (l.p).x - h.hx, (l.p).y - h.hy,
-                                    (l.p).z - h.hz OFFSET 0) AS lv(vx, vy, vz)
+         CROSS JOIN LATERAL (
+           SELECT (l.p).x, (l.p).y, (l.p).z OFFSET 0) AS sp(px, py, pz)
+         CROSS JOIN LATERAL (SELECT sp.px - h.hx, sp.py - h.hy,
+                                    sp.pz - h.hz OFFSET 0) AS lv(vx, vy, vz)
          CROSS JOIN LATERAL (SELECT sqrt(lv.vx * lv.vx + lv.vy * lv.vy
                                          + lv.vz * lv.vz) OFFSET 0) AS dd(dist)
          CROSS JOIN LATERAL (SELECT lv.vx * (1.0 / dd.dist),
@@ -465,7 +475,8 @@ BEGIN
                              OFFSET 0) AS sl(ldx, ldy, ldz)
     WHERE wants_light(v3(h.dx, h.dy, h.dz),
                       hit_of(h.t, h.mat, h.hx, h.hy, h.hz,
-                             h.nx, h.ny, h.nz, h.back), m, l);
+                             h.nx, h.ny, h.nz, h.back), m, l,
+                      v3(sp.px, sp.py, sp.pz));
     ANALYZE rt_sray;
 
     -- Transmission toward the light, per blocking mesh.  An opaque mesh stops
@@ -554,7 +565,8 @@ BEGIN
              light_rad(v3(h.dx, h.dy, h.dz),
                        hit_of(h.t, h.mat, h.hx, h.hy, h.hz,
                               h.nx, h.ny, h.nz, h.back),
-                       m, l, coalesce(sh.att, ROW(1,1,1)::vec3)) AS e
+                       m, l, v3(s.lpx, s.lpy, s.lpz),
+                       coalesce(sh.att, ROW(1,1,1)::vec3)) AS e
       FROM rt_sray s
            JOIN rt_hit h    ON h.hid = s.hid
            JOIN material m  ON m.mat_id = h.mat

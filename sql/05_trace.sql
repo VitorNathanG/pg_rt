@@ -106,10 +106,21 @@ CREATE FUNCTION beer(h hit, m material) RETURNS vec3 AS $$
 -- make_hit: pow_safe names its base three times, so handing it twenty
 -- operators' worth of arithmetic stops it inlining and turns a handful of
 -- flops into a per-call executor run.
-CREATE FUNCTION light_rad(d vec3, h hit, m material, l light, sh vec3)
+-- `lp` is the point on the light this shadow ray was actually aimed at, and it
+-- is an argument rather than something read back off `l` because the position
+-- is used on both sides of a dependency: the renderer builds the ray toward it
+-- and this function shades from it.  Deriving it twice is how a frame comes out
+-- internally inconsistent -- the same failure mode as a light that moves
+-- mid-render, where the shadows are cast toward where it was and the shading is
+-- computed from where it went.  Passing the point makes the two agree by
+-- construction rather than by both happening to read the same column.
+--
+-- For a point light the two coincide, which is what the five-argument spelling
+-- below says, and it is the only kind of light there is today.
+CREATE FUNCTION light_rad(d vec3, h hit, m material, l light, lp vec3, sh vec3)
 RETURNS vec3 AS $$
 DECLARE
-  lv   vec3   := l.p - (h).p;
+  lv   vec3   := lp - (h).p;
   dist float8 := v3_len(lv);
   ld   vec3   := lv * (1.0 / dist);
   hv   vec3;
@@ -128,6 +139,14 @@ BEGIN
   RETURN l.col * pow_safe(cs, m.spec_e) * sh;
 END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
+-- A light sampled at its own position.  The renderer never calls this -- it
+-- always knows which point it traced toward -- but it is the honest scalar
+-- spelling, and it keeps the call sites in psql and in the suite readable.
+CREATE FUNCTION light_rad(d vec3, h hit, m material, l light, sh vec3)
+RETURNS vec3 AS $$
+  SELECT light_rad(d, h, m, l, l.p, sh)
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
 -- A (hit, light) pair is worth a shadow ray only where that light can actually
 -- show: on a diffuse surface facing it, or inside a specular lobe aimed at it.
 -- The lobes are tight, so this rejects most of the frame's non-diffuse hits
@@ -137,16 +156,22 @@ END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 -- The same predicate also decides which pairs contribute at all: below these
 -- thresholds light_rad's answer rounds away, so the renderer sums only what
 -- survives here.
-CREATE FUNCTION wants_light(d vec3, h hit, m material, l light) RETURNS boolean AS $$
+CREATE FUNCTION wants_light(d vec3, h hit, m material, l light, lp vec3)
+RETURNS boolean AS $$
 DECLARE ld vec3; hv vec3; cs float8;
 BEGIN
   IF (h).mat = 0 THEN RETURN false; END IF;
-  ld := v3_unit(l.p - (h).p);
+  ld := v3_unit(lp - (h).p);
   IF m.kind = mat_diffuse() THEN RETURN v3_dot((h).n, ld) > 0.0; END IF;
   hv := v3_unit(ld - d);                    -- local: see light_rad
   cs := greatest(v3_dot((h).n, hv), 0.0);
   RETURN pow_safe(cs, m.spec_e) >= 1e-4;
 END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
+
+CREATE FUNCTION wants_light(d vec3, h hit, m material, l light)
+RETURNS boolean AS $$
+  SELECT wants_light(d, h, m, l, l.p)
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- ---------------------------------------------------------------------------
 -- shade: the radiance a hit contributes directly, already weighted by the
