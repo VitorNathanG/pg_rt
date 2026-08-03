@@ -16,6 +16,7 @@ are not portable; the ratios are the part that carries.
 | [`deflate.md`](deflate.md) | The PNG compressor: accumulators, a quadratic detoast, Huffman under a depth cap, and why per-scanline filtering loses here |
 | [`sampling.md`](sampling.md) | Adaptive antialiasing: why a refined pixel discards its coarse sample, and why selecting edges selects the expensive rays |
 | [`gif.md`](gif.md) | The 256-colour quantiser: a palette that wasted a fifth of itself, a lookup that was wrong half the time, and why dithering is off |
+| [`area-lights.md`](area-lights.md) | Softboxes: why a grid of point lights terraces, what per-hit sampling costs when nothing uses it, and why stratification beats antialiasing |
 
 Two habits these notes assume, both learned the hard way:
 

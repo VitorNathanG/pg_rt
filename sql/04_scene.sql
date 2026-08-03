@@ -7,11 +7,32 @@
 -- ---------------------------------------------------------------------------
 
 -- Lights are rows, for the reason materials are rows: nothing downstream
--- branches on *which* light it is looking at, so a rim light, a coloured fill,
--- or the several samples that make up one area light are INSERTs rather than
--- new SQL.  The renderer treats (hit, light) as its unit of work and resolves
--- every pair in one pass, so a second light costs a second shadow ray per lit
--- hit -- not a second traversal of the scene.
+-- branches on *which* light it is looking at, so a rim light or a coloured
+-- fill is an INSERT rather than new SQL.  The renderer treats (hit, light) as
+-- its unit of work and resolves every pair in one pass, so a second light
+-- costs a second shadow ray per lit hit -- not a second traversal of the
+-- scene.
+--
+-- An area light is one row too, and that is a decision worth defending,
+-- because the obvious alternative works without any of this.  A softbox can be
+-- approximated by N*N ordinary point lights spread over a rectangle at pow/N^2
+-- each: no code at all, and it does produce a penumbra.  What it cannot
+-- produce is an unbiased one.  Every hit in the frame sums the same N^2 rows,
+-- so the error is identical everywhere and the penumbra comes out as N^2
+-- terraces at fixed positions in the world -- and antialiasing cannot touch
+-- them, because each sub-sample of a pixel is a separate hit that sees the
+-- same light table.  Worse, the sample count ends up set by the tightest
+-- specular lobe in the scene rather than by the softness wanted: at spec_e 260
+-- a chrome ball resolves a 4x4 grid as four separate glints.
+--
+-- So the emitter stays one row with a shape, and the sampling moves to the
+-- hit.  `u` and `v` are half-extents -- the light spans p +/- u +/- v -- and
+-- `samples` is per axis, exactly as `aa` is: samples = 4 fires 16 shadow rays
+-- per hit, as aa = 4 casts 16 camera rays per pixel.  Where those 16 land is
+-- decorrelated per hit, which turns the terraces into noise, and noise is what
+-- `aa` was already averaging.  That is the whole return: a pixel at aa = 2
+-- covers four times as much of the emitter as its shadow-ray count suggests,
+-- because its four sub-samples are four different hits.
 --
 -- `pow` is radiant intensity: the shading divides it by the squared distance,
 -- so the same number means the same brightness only at the same range.
@@ -39,10 +60,94 @@ CREATE TABLE light (
   sky_k   float8 NOT NULL DEFAULT 0.0,     -- sky disc brightness, 0 = invisible
   sky_e   float8 NOT NULL DEFAULT 420.0,   -- sky disc tightness
   sky_dir vec3 GENERATED ALWAYS AS (v3_unit(p)) STORED,
+
+  u       vec3   NOT NULL DEFAULT ROW(0, 0, 0)::vec3,  -- half-extent, one axis
+  v       vec3   NOT NULL DEFAULT ROW(0, 0, 0)::vec3,  -- half-extent, the other
+  samples int    NOT NULL DEFAULT 1,                   -- per axis, like aa
+
+  -- Which way the panel faces, and therefore which half of the world it lights
+  -- and how much of itself a surface can see.  NULL means a point light: no
+  -- extent, no orientation, and no cosine.  Every reader has to test for that
+  -- NULL explicitly rather than letting it flow into arithmetic, because
+  -- greatest(NULL, 0.0) is 0.0 and would switch the light off in silence --
+  -- the same trap that once painted 846 pixels pure black.
+  nrm     vec3 GENERATED ALWAYS AS (
+            CASE WHEN ((u).x = 0.0 AND (u).y = 0.0 AND (u).z = 0.0)
+                   OR ((v).x = 0.0 AND (v).y = 0.0 AND (v).z = 0.0)
+                 THEN NULL
+                 ELSE v3_unit(v3_cross(u, v)) END) STORED,
+
   -- v3_unit is undefined at the origin, and a NULL direction would poison the
   -- radiance sum silently rather than fail.
-  CHECK ((p).x <> 0.0 OR (p).y <> 0.0 OR (p).z <> 0.0)
+  CHECK ((p).x <> 0.0 OR (p).y <> 0.0 OR (p).z <> 0.0),
+  CHECK (samples >= 1)
 );
+
+-- Where on the emitter one hit should look, once per sample.
+--
+-- The grid is stratified rather than random: sample s takes cell
+-- (s % samples, s / samples), so the emitter is always covered evenly and a
+-- run of samples can never clump the way independent uniform draws do.  Only
+-- the position *within* each cell is random, and it is a hash of the hit
+-- rather than a random(), for three reasons that all matter here: it is
+-- IMMUTABLE, so the planner may hoist and parallelise it; it is reproducible,
+-- so a frame is a function of the scene and re-rendering it gives the same
+-- bytes; and it decorrelates hit from hit, which is the entire point -- two
+-- adjacent pixels, or two sub-samples of one pixel, look at different parts of
+-- the light and their average covers more of it than either alone.
+--
+-- The renderer does NOT call this; it inlines the same arithmetic into the
+-- shadow-ray CTAS, for the reason sky() is not called either -- a function
+-- invocation per shadow ray costs more than the arithmetic in it.  This is the
+-- scalar spelling, so a light's sample pattern can be plotted from psql, and
+-- the test suite holds the two to the same answers.
+CREATE FUNCTION light_sample(l light, hid bigint)
+RETURNS TABLE (s int, p vec3) AS $$
+  SELECT g.s, l.p + l.u * a.su + l.v * a.sv
+  FROM generate_series(0, l.samples * l.samples - 1) AS g(s)
+       CROSS JOIN LATERAL (
+         SELECT hashint8(hid * 1000003 + g.s)) AS q(w)
+       CROSS JOIN LATERAL (
+         SELECT 2.0 * ((g.s % l.samples)::float8
+                       + ((q.w & 65535)::float8 + 0.5) / 65536.0)
+                     / l.samples::float8 - 1.0,
+                2.0 * ((g.s / l.samples)::float8
+                       + (((q.w >> 16) & 65535)::float8 + 0.5) / 65536.0)
+                     / l.samples::float8 - 1.0) AS a(su, sv)
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
+-- A rectangular light of a given size, aimed at a point.
+--
+-- The aim is what makes this worth a function rather than two INSERTs: the
+-- half-extents have to span the plane the panel faces along, and their cross
+-- product has to come out pointing at the subject rather than away from it,
+-- which is a sign nobody wants to rediscover.  v = f x u rather than u x f is
+-- the whole of it.
+CREATE FUNCTION light_softbox(p_name text, p_p vec3, p_at vec3,
+                              p_w float8, p_h float8,
+                              p_samples int DEFAULT 2,
+                              p_pow float8 DEFAULT 100.0,
+                              p_col vec3 DEFAULT ROW(1, 1, 1)::vec3,
+                              p_sky_k float8 DEFAULT 0.0,
+                              p_sky_e float8 DEFAULT 420.0)
+RETURNS int AS $$
+DECLARE
+  f  vec3 := v3_unit(p_at - p_p);
+  up vec3;
+  su vec3;
+  id int;
+BEGIN
+  -- Any up vector will do except the one parallel to the aim, which would make
+  -- the cross product zero and the panel's orientation undefined.
+  up := CASE WHEN abs((f).y) > 0.999 THEN ROW(0, 0, 1)::vec3
+                                     ELSE ROW(0, 1, 0)::vec3 END;
+  su := v3_unit(v3_cross(f, up));
+  INSERT INTO light (name, p, col, pow, sky_k, sky_e, u, v, samples)
+  VALUES (p_name, p_p, p_col, p_pow, p_sky_k, p_sky_e,
+          su * (p_w * 0.5), v3_cross(f, su) * (p_h * 0.5), p_samples)
+  RETURNING light_id INTO id;
+  RETURN id;
+END $$ LANGUAGE plpgsql;
 
 CREATE FUNCTION sky_bg(d vec3) RETURNS vec3 AS $$
   SELECT ROW(0.20, 0.40, 0.86)::vec3 * greatest((d).y, 0.0)

@@ -30,7 +30,7 @@ whose neighbours disagreed with them, which were traced again at four. That is
 ```bash
 docker compose up -d      # PostgreSQL 17
 ./load.sh                 # install the engine and build the default scene
-./test.sh                 # 186 checks on the codecs, the geometry and the optics
+./test.sh                 # 200 checks on the codecs, the geometry and the optics
 ./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
 
@@ -108,6 +108,31 @@ INSERT INTO light (name, p, col, pow) VALUES
 background as well as on the surfaces it lights. Keeping that on the light
 rather than in the sky is what holds the two consistent: move the light and its
 reflection moves with it.
+
+A light can also have a size, which is what makes a shadow soft:
+
+```sql
+SELECT light_softbox('key', ROW(5.2, 4.6, -2.4)::vec3,  -- where it is
+                            ROW(0.0, 1.0,  0.0)::vec3,  -- what it aims at
+                     4.0, 4.0,      -- a four-unit square panel
+                     4,             -- samples per axis, so 16 rays per hit
+                     125.0);
+```
+
+It is still one row. Each hit picks its own points on the panel — stratified
+over a grid, jittered by a hash of the hit — so neighbouring pixels sample
+different parts of the light and their average covers more of it than either
+alone. That per-hit part is the whole difference from spreading sixteen point
+lights over the same rectangle, which costs the same and bands, because every
+pixel in the frame would be summing the identical sixteen rows.
+
+The cost is `samples²` shadow rays per lit hit and nothing else: transport does
+not change, and a scene with no area light in it pays 2.4% for the machinery.
+Buy softness with `samples` rather than with `aa` — the samples inside one hit
+are stratified and the ones spread across sub-samples are not, so at equal ray
+count `samples 4, aa 1` is both cleaner and four times faster than
+`samples 1, aa 4`. Measured in
+[`research/area-lights.md`](research/area-lights.md).
 
 ## Renders are rows too
 
@@ -466,11 +491,11 @@ once.
 | `sql/02_gif.sql` | median-cut quantiser, ordered dither, LZW both ways, GIF framing |
 | `sql/02_png.sql` | CRC-32, the five scanline filters, PNG chunk framing, PNG decoding |
 | `sql/03_mesh.sql` | mesh/material/triangle tables, transforms, intersection, BVH, OBJ loader |
-| `sql/04_scene.sql` | the light table, sky, the default scene |
+| `sql/04_scene.sql` | the light table, area-light sampling, sky, the default scene |
 | `sql/05_trace.sql` | Fresnel, absorption, direct lighting, ray spawning |
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
 | `sql/07_frame.sql` | the frame table, the render that stores its result, the queue |
-| `test/tests.sql` | 186 checks |
+| `test/tests.sql` | 200 checks |
 | `examples/` | a torus OBJ, the scene that loads it, a camera orbit and its GIF, a moving scene |
 | [`research/`](research) | the measurements behind the design |
 
@@ -502,14 +527,21 @@ once.
   primary hits against one pose, reflections against another — rather than
   merely stale. A caller that must do both at once should take its snapshot
   explicitly with `BEGIN ISOLATION LEVEL REPEATABLE READ`.
-* Lights are points, so shadows are hard-edged. An area light is several rows
-  sampling one emitter — the renderer already sums them and needs no change —
-  but placing those samples well needs a PRNG, and `random()` is `VOLATILE` and
-  would break the planner's assumptions, so it would have to be a hash of the
-  ray index.
-* A light costs one shadow ray per hit it can reach, so render time is linear
-  in the light count — but only in the shadow pass, not in shading. Numbers in
-  [`research/timings.md`](research/timings.md).
+* Area lights are sampled uniformly over the panel's **area**, which is the
+  high-variance choice exactly when the panel is large and close — the far
+  corners barely contribute and still take a quarter of the samples. Sampling
+  the solid angle it subtends instead would cut the noise at the same ray
+  count. The specular response is averaged rather than importance-sampled as
+  well, so a large panel dims the chrome highlight rather than broadening it.
+* An emitter has no appearance of its own. `sky_k` paints a distant disc
+  measured from the world origin, which is the approximation a *near* softbox
+  breaks: the panel lights the scene from one place and is reflected as if it
+  were somewhere else. A real emitter would be geometry with a material.
+* A light costs `samples²` shadow rays per hit it can reach, so render time is
+  linear in the light count and quadratic in a panel's sampling — but only in
+  the shadow and lighting passes, never in transport. Numbers in
+  [`research/timings.md`](research/timings.md) and
+  [`research/area-lights.md`](research/area-lights.md).
 * The ground plane's Fresnel reflectance is capped below its physical value.
   Uncapped, a grazing-angle mirror floor reflects the bright uniform sky
   across the whole lower frame and erases its own shadows.

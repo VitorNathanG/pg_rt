@@ -439,20 +439,28 @@ BEGIN
       ANALYZE rt_ray;
     END LOOP;
 
-    -- Shadow rays, also in one pass -- one per (hit, light) pair that the light
-    -- in question could actually show on.  The pair, not the hit, is the unit of
-    -- work from here down: a scene with three lights fires three shadow rays at
-    -- an open floor and none at all at a wall facing away from all three.
+    -- Shadow rays, also in one pass -- one per (hit, light, sample) triple that
+    -- the light in question could actually show on.  The triple, not the hit, is
+    -- the unit of work from here down: a scene with three lights fires three
+    -- shadow rays at an open floor and none at all at a wall facing away from
+    -- all three.
     --
-    -- `sp` is the point on the light this ray is aimed at, and it is *stored*
-    -- rather than recomputed downstream.  It is read on both sides of a
-    -- dependency -- the ray is traced toward it, and the shading is then
-    -- evaluated from it -- so a renderer that derived it twice would be relying
-    -- on two reads of one column agreeing.  Today they always do, because a
-    -- light is a point and there is only one place to aim at.
+    -- `sp` is where on the emitter this ray is aimed, and it is the arithmetic
+    -- of light_sample() written out rather than the call.  That duplication is
+    -- deliberate and it was measured before it was accepted: a set-returning
+    -- LANGUAGE sql function is not inlined the way a scalar one is, so calling
+    -- it here costs a function scan and a tuplestore per lit pair and takes the
+    -- shadow phase from 980 ms to 3270 ms -- 3.3x, for arithmetic worth about a
+    -- tenth of that.  A golden hash over an area-light frame is what stops the
+    -- copy drifting from the original.
+    --
+    -- The sampled point is then *stored*, not recomputed downstream.  It is
+    -- read on both sides of a dependency -- the ray is traced toward it and the
+    -- shading is evaluated from it -- and a renderer that recomputed it would
+    -- shade every soft shadow from a point it never traced.
     ts := clock_timestamp();
     CREATE TEMP TABLE rt_sray AS
-    SELECT h.hid, l.light_id,
+    SELECT h.hid, l.light_id, g.s AS smp,
            h.hx + h.nx * 1e-3 AS ox,
            h.hy + h.ny * 1e-3 AS oy,
            h.hz + h.nz * 1e-3 AS oz,
@@ -463,8 +471,27 @@ BEGIN
     FROM rt_hit h
          JOIN material m ON m.mat_id = h.mat
          CROSS JOIN light l
+         CROSS JOIN LATERAL generate_series(0, l.samples * l.samples - 1) AS g(s)
+         -- Skipped outright for a point light, whose sample cannot be anywhere
+         -- but its position.  Worth a branch because it is the only part of
+         -- this that a scene with no area light would otherwise pay for.
          CROSS JOIN LATERAL (
-           SELECT (l.p).x, (l.p).y, (l.p).z OFFSET 0) AS sp(px, py, pz)
+           SELECT CASE WHEN l.nrm IS NOT NULL
+                       THEN hashint8(h.hid::bigint * 1000003 + g.s)
+                       ELSE 0 END OFFSET 0) AS q(w)
+         CROSS JOIN LATERAL (
+           SELECT 2.0 * ((g.s % l.samples)::float8
+                         + ((q.w & 65535)::float8 + 0.5) / 65536.0)
+                       / l.samples::float8 - 1.0,
+                  2.0 * ((g.s / l.samples)::float8
+                         + (((q.w >> 16) & 65535)::float8 + 0.5) / 65536.0)
+                       / l.samples::float8 - 1.0
+           OFFSET 0) AS a(su, sv)
+         CROSS JOIN LATERAL (
+           SELECT (l.p).x + (l.u).x * a.su + (l.v).x * a.sv,
+                  (l.p).y + (l.u).y * a.su + (l.v).y * a.sv,
+                  (l.p).z + (l.u).z * a.su + (l.v).z * a.sv
+           OFFSET 0) AS sp(px, py, pz)
          CROSS JOIN LATERAL (SELECT sp.px - h.hx, sp.py - h.hy,
                                     sp.pz - h.hz OFFSET 0) AS lv(vx, vy, vz)
          CROSS JOIN LATERAL (SELECT sqrt(lv.vx * lv.vx + lv.vy * lv.vy
@@ -493,7 +520,7 @@ BEGIN
     -- because the direction was not normalised on the way in.
     CREATE TEMP TABLE rt_shadow AS
     WITH smray AS MATERIALIZED (
-        SELECT s.hid, s.light_id, s.dist, mb.mesh_id, ms.mat_id,
+        SELECT s.hid, s.light_id, s.smp, s.dist, mb.mesh_id, ms.mat_id,
                q.ox, q.oy, q.oz, q.dx, q.dy, q.dz,
                1.0 / nz(q.dx) AS ivx, 1.0 / nz(q.dy) AS ivy, 1.0 / nz(q.dz) AS ivz
         FROM rt_sray s
@@ -511,7 +538,7 @@ BEGIN
                OFFSET 0) AS q(ox, oy, oz, dx, dy, dz)
     ),
     blocker AS (
-      SELECT s.hid, s.light_id, s.mesh_id, mm.kind, mm.absorb,
+      SELECT s.hid, s.light_id, s.smp, s.mesh_id, mm.kind, mm.absorb,
              min(x.t) AS t0, max(x.t) AS t1
       FROM smray s
            JOIN bvh_node n  ON n.mesh_id = s.mesh_id
@@ -527,17 +554,17 @@ BEGIN
                             t.e2x, t.e2y, t.e2z, t.gnx, t.gny, t.gnz)
              OFFSET 0) AS x(t)
       WHERE x.t IS NOT NULL AND x.t < s.dist
-      GROUP BY s.hid, s.light_id, s.mesh_id, mm.kind, mm.absorb
+      GROUP BY s.hid, s.light_id, s.smp, s.mesh_id, mm.kind, mm.absorb
     )
-    SELECT hid, light_id,
+    SELECT hid, light_id, smp,
            CASE WHEN bool_or(kind <> mat_glass()) THEN ROW(0, 0, 0)::vec3
                 ELSE ROW(exp(-sum((absorb).x * (t1 - t0))),
                          exp(-sum((absorb).y * (t1 - t0))),
                          exp(-sum((absorb).z * (t1 - t0))))::vec3 * 0.82
            END AS att
-    FROM blocker GROUP BY hid, light_id;
+    FROM blocker GROUP BY hid, light_id, smp;
 
-    CREATE INDEX ON rt_shadow (hid, light_id);
+    CREATE INDEX ON rt_shadow (hid, light_id, smp);
     ANALYZE rt_shadow;
 
     IF p_verbose THEN
@@ -572,6 +599,7 @@ BEGIN
            JOIN material m  ON m.mat_id = h.mat
            JOIN light l     ON l.light_id = s.light_id
            LEFT JOIN rt_shadow sh ON sh.hid = s.hid AND sh.light_id = s.light_id
+                                 AND sh.smp = s.smp
       UNION ALL
       SELECT h.hid, sky_sun(v3(h.dx, h.dy, h.dz), l)
       FROM rt_hit h CROSS JOIN light l

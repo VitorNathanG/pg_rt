@@ -107,41 +107,54 @@ CREATE FUNCTION beer(h hit, m material) RETURNS vec3 AS $$
 -- operators' worth of arithmetic stops it inlining and turns a handful of
 -- flops into a per-call executor run.
 -- `lp` is the point on the light this shadow ray was actually aimed at, and it
--- is an argument rather than something read back off `l` because the position
--- is used on both sides of a dependency: the renderer builds the ray toward it
--- and this function shades from it.  Deriving it twice is how a frame comes out
--- internally inconsistent -- the same failure mode as a light that moves
--- mid-render, where the shadows are cast toward where it was and the shading is
--- computed from where it went.  Passing the point makes the two agree by
--- construction rather than by both happening to read the same column.
+-- is an argument rather than something read back off `l` for a reason that has
+-- already cost this renderer a bug once: the position is used on both sides of
+-- a dependency.  The shadow ray was built toward lp and tested for occlusion
+-- along that line; if the shading then recomputed a position, the two would be
+-- answering about different points, and every soft shadow would be lit from
+-- somewhere it was never traced from.  A point light is the case where they
+-- coincide, which is what the five-argument spelling below says.
 --
--- For a point light the two coincide, which is what the five-argument spelling
--- below says, and it is the only kind of light there is today.
+-- `w` is what makes several samples add up to one emitter rather than to
+-- several: each carries 1/samples^2 of it.  Averaging is right for both
+-- branches -- the diffuse one because irradiance is linear in power, the
+-- specular one because the soft highlight *is* the mean of the lobe taken over
+-- the panel.
 CREATE FUNCTION light_rad(d vec3, h hit, m material, l light, lp vec3, sh vec3)
 RETURNS vec3 AS $$
 DECLARE
   lv   vec3   := lp - (h).p;
   dist float8 := v3_len(lv);
   ld   vec3   := lv * (1.0 / dist);
+  w    float8 := 1.0 / (l.samples * l.samples)::float8;
   hv   vec3;
   ndl  float8;
   cs   float8;
 BEGIN
+  -- A panel emits into the hemisphere it faces and carries its own
+  -- foreshortening, so a surface off to its side sees less of it.  NULL is a
+  -- point light, which has no orientation and therefore no cosine, and it has
+  -- to be tested rather than folded into the arithmetic: greatest(NULL, 0.0)
+  -- is 0.0, so the tidier spelling would darken every point light to nothing.
+  IF l.nrm IS NOT NULL THEN
+    w := w * greatest(-v3_dot(ld, l.nrm), 0.0);
+  END IF;
   IF m.kind = mat_diffuse() THEN
     ndl := greatest(v3_dot((h).n, ld), 0.0);
-    RETURN l.col * (l.pow / (dist * dist) * ndl) * sh;
+    RETURN l.col * (l.pow / (dist * dist) * ndl * w) * sh;
   END IF;
   -- The half vector goes through a local as well: v3_dot names each of its
   -- arguments three times, and v3_unit expanded in place is far past the
   -- point where that stops inlining.
   hv := v3_unit(ld - d);
   cs := greatest(v3_dot((h).n, hv), 0.0);
-  RETURN l.col * pow_safe(cs, m.spec_e) * sh;
+  RETURN l.col * (pow_safe(cs, m.spec_e) * w) * sh;
 END $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
--- A light sampled at its own position.  The renderer never calls this -- it
--- always knows which point it traced toward -- but it is the honest scalar
--- spelling, and it keeps the call sites in psql and in the suite readable.
+-- A light sampled at its own position, which for a point light is the only
+-- place it can be sampled.  The renderer never calls this -- it always knows
+-- which sample it traced -- but it is the honest scalar spelling, and it keeps
+-- the point-light case readable in psql and in the suite.
 CREATE FUNCTION light_rad(d vec3, h hit, m material, l light, sh vec3)
 RETURNS vec3 AS $$
   SELECT light_rad(d, h, m, l, l.p, sh)
@@ -162,6 +175,10 @@ DECLARE ld vec3; hv vec3; cs float8;
 BEGIN
   IF (h).mat = 0 THEN RETURN false; END IF;
   ld := v3_unit(lp - (h).p);
+  -- Behind the panel there is nothing to trace toward, and this is the only
+  -- place that costs nothing to check: rejecting here saves the shadow ray as
+  -- well as the shading.
+  IF l.nrm IS NOT NULL AND v3_dot(ld, l.nrm) >= 0.0 THEN RETURN false; END IF;
   IF m.kind = mat_diffuse() THEN RETURN v3_dot((h).n, ld) > 0.0; END IF;
   hv := v3_unit(ld - d);                    -- local: see light_rad
   cs := greatest(v3_dot((h).n, hv), 0.0);

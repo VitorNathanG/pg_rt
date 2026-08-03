@@ -1011,7 +1011,8 @@ SELECT ok(wants_light(v3(0,-1,0), h, m_floor(), l_key())
           'the same hit wants the light above it and not the one below')
 FROM (SELECT ROW(1.0, (m_floor()).mat_id, v3(-6,0,4), v3(0,1,0), false)::hit) AS q(h),
      LATERAL (SELECT ROW(0, 'below', v3(-6,-8,4), v3(1,1,1), 125.0, 0.0, 420.0,
-                         v3_unit(v3(-6,-8,4)))::light) AS u(l_under);
+                         v3_unit(v3(-6,-8,4)),
+                         v3(0,0,0), v3(0,0,0), 1, NULL)::light) AS u(l_under);
 
 \echo
 \echo == lights ==
@@ -1044,7 +1045,8 @@ SELECT ok(near(v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_half, v3(1,1,1))) *
 FROM (SELECT ROW(1.0, (m_floor()).mat_id, v3(-6,0,4), v3(0,1,0), false)::hit) AS q(h),
      LATERAL (SELECT ROW((l_key()).light_id, 'half', (l_key()).p, (l_key()).col,
                          (l_key()).pow / 2.0, 0.0, 420.0,
-                         (l_key()).sky_dir)::light) AS u(l_half);
+                         (l_key()).sky_dir,
+                         v3(0,0,0), v3(0,0,0), 1, NULL)::light) AS u(l_half);
 
 -- The sky disc must sit where the light does, because that is the whole reason
 -- it is a column of the light rather than a constant of the sky.
@@ -1063,6 +1065,176 @@ FROM light;
 -- silently producing a NULL that would poison the radiance sum.
 SELECT ok(raises($$INSERT INTO light (name, p) VALUES ('nowhere', ROW(0,0,0)::vec3)$$),
           'a light at the world origin is refused');
+
+\echo
+\echo == area lights ==
+
+-- A 3x2 panel two units up the z axis, facing back down it at the origin.
+-- The order of the extents is what aims it: u x v is the facing, so swapping
+-- them turns the light around.
+CREATE OR REPLACE FUNCTION l_box() RETURNS light AS $$
+  SELECT ROW(0, 'box', v3(0,0,2), v3(1,1,1), 100.0, 0.0, 420.0, v3(0,0,1),
+             v3(0,1.5,0), v3(1,0,0), 3,
+             v3_unit(v3_cross(v3(0,1.5,0), v3(1,0,0))))::light
+$$ LANGUAGE sql IMMUTABLE;
+
+-- The same panel turned sixty degrees about y, so that it still sits in the
+-- same place and is still the same size, and only its facing has changed.
+CREATE OR REPLACE FUNCTION l_box60() RETURNS light AS $$
+  SELECT ROW(0, 'box60', v3(0,0,2), v3(1,1,1), 100.0, 0.0, 420.0, v3(0,0,1),
+             v3(0,1.5,0), v3(0.5, 0, sqrt(3.0)/2.0), 3,
+             v3_unit(v3_cross(v3(0,1.5,0), v3(0.5, 0, sqrt(3.0)/2.0))))::light
+$$ LANGUAGE sql IMMUTABLE;
+
+SELECT ok((SELECT count(*) FROM light_sample(l_box(), 7)) = 9,
+          'a light of samples n yields n squared samples per hit');
+
+-- Every sample is on the panel.  Checked by projecting onto the two extent
+-- axes, because that is the statement -- "inside the rectangle" -- rather than
+-- a bounding box that would also accept the corners of the cube around it.
+SELECT ok(bool_and(abs(v3_dot(s.p - (l_box()).p, v3(1,0,0))) <= 1.0
+               AND abs(v3_dot(s.p - (l_box()).p, v3(0,1,0))) <= 1.5),
+          'every sample lands on the panel and none outside it')
+FROM light_sample(l_box(), 7) AS s;
+
+-- Stratified, not merely random: n squared samples occupy n squared distinct
+-- cells.  This is the property that stops a run of samples clumping, and it is
+-- invisible in an image until the sample count is low enough to matter.
+SELECT ok(count(DISTINCT (cu, cv)) = 9, 'the samples cover every cell exactly once')
+FROM light_sample(l_box(), 7) AS s,
+     LATERAL (SELECT least(2, greatest(0, floor((v3_dot(s.p - (l_box()).p, v3(1,0,0))
+                                                 / 1.0 + 1.0) * 1.5)::int)),
+                     least(2, greatest(0, floor((v3_dot(s.p - (l_box()).p, v3(0,1,0))
+                                                 / 1.5 + 1.0) * 1.5)::int)))
+             AS c(cu, cv);
+
+-- Reproducible, because it is a hash of the hit and not a random(): the same
+-- frame rendered twice is the same bytes, which the golden hashes below rely on.
+SELECT ok((SELECT array_agg(p ORDER BY s) FROM light_sample(l_box(), 7))
+        = (SELECT array_agg(p ORDER BY s) FROM light_sample(l_box(), 7)),
+          'one hit samples the same points every time it is asked');
+
+-- ...and decorrelated, which is the entire reason the sample depends on the
+-- hit at all.  Two hits agreeing would be N^2 point lights again.
+SELECT ok((SELECT array_agg(p ORDER BY s) FROM light_sample(l_box(), 7))
+       <> (SELECT array_agg(p ORDER BY s) FROM light_sample(l_box(), 8)),
+          'two different hits look at different parts of the light');
+
+-- A point light has one place to be sampled, and the extent arithmetic must
+-- leave it exactly there rather than near it.
+SELECT ok((SELECT count(*) FROM light_sample(l_key(), 7)) = 1
+      AND (SELECT p FROM light_sample(l_key(), 7)) = (l_key()).p,
+          'a point light samples its own position, exactly');
+
+-- The aim is the part with a sign in it, and a panel facing away from its
+-- subject lights nothing at all -- so this is worth pinning rather than
+-- eyeballing.  The insert is its own statement because a row written by a
+-- function is not visible to the rest of the statement that called it.
+SELECT light_softbox('t_sb', v3(4,3,0), v3(0,1,0), 3.0, 2.0, 2, 50.0);
+SELECT ok(near(v3_dot(nrm, v3_unit(v3(0,1,0) - v3(4,3,0))), 1.0)
+      AND near(v3_len(u) * 2.0, 3.0) AND near(v3_len(v) * 2.0, 2.0),
+          'a softbox faces the point it was aimed at, at the size asked for')
+FROM light WHERE name = 't_sb';
+DELETE FROM light WHERE name = 't_sb';
+
+-- A panel emits into the hemisphere it faces.  Behind it there is nothing to
+-- trace toward, and rejecting that in wants_light saves the shadow ray too.
+SELECT ok(wants_light(v3(0,0,-1), h_front, m_floor(), l_box(), (l_box()).p)
+      AND NOT wants_light(v3(0,0,1), h_back, m_floor(), l_box(), (l_box()).p),
+          'a panel lights what it faces and nothing behind it')
+FROM (SELECT ROW(1.0, (m_floor()).mat_id, v3(0,0,0), v3(0,0,1), false)::hit,
+             ROW(1.0, (m_floor()).mat_id, v3(0,0,4), v3(0,0,1), false)::hit)
+     AS q(h_front, h_back);
+
+-- The emitter's own foreshortening.  Isolated by turning the panel rather than
+-- by moving the surface, because moving it would change the distance and the
+-- surface's own cosine at the same time and the ratio would measure all three:
+-- same hit, same point on the light, same everything but the facing, and a
+-- panel seen at sixty degrees delivers half.
+--
+-- A point light has no orientation and therefore no such factor, which is why
+-- nrm is NULL there rather than some default direction, and why every reader
+-- of it tests for NULL instead of folding it into a greatest().
+SELECT ok(near(v3_maxc(light_rad(v3(0,0,-1), h, m_floor(), l_box60(),
+                                 (l_box()).p, v3(1,1,1)))
+               / v3_maxc(light_rad(v3(0,0,-1), h, m_floor(), l_box(),
+                                   (l_box()).p, v3(1,1,1))),
+               0.5, 1e-9),
+          'the panel delivers its cosine, so sixty degrees off axis is half')
+FROM (SELECT ROW(1.0, (m_floor()).mat_id, v3(0,0,0), v3(0,0,1), false)::hit)
+     AS q(h);
+
+-- Samples average rather than accumulate, or an area light would be its own
+-- sample count times too bright.  Zero extent makes the samples coincide, so
+-- nine of them must come to exactly the one a point light casts.
+SELECT ok(near(v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_wide,
+                                 (l_wide).p, v3(1,1,1)))
+               * 9.0,
+               v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_key(), v3(1,1,1)))),
+          'nine samples of one emitter add up to the emitter')
+FROM (SELECT ROW(1.0, (m_floor()).mat_id, v3(-6,0,4), v3(0,1,0), false)::hit) AS q(h),
+     LATERAL (SELECT ROW((l_key()).light_id, 'wide', (l_key()).p, (l_key()).col,
+                         (l_key()).pow, 0.0, 420.0, (l_key()).sky_dir,
+                         v3(0,0,0), v3(0,0,0), 3, NULL)::light) AS u(l_wide);
+
+SELECT ok(raises($$INSERT INTO light (name, p, samples) VALUES ('none', v3(1,1,1), 0)$$),
+          'a light must take at least one sample');
+
+-- The golden hash for the sampled path.  The renderer does not call
+-- light_sample -- it inlines the same arithmetic, because the function form
+-- costs 3.3x on the shadow phase -- so this is what holds the copy to the
+-- original: any drift in either moves these bytes.
+DELETE FROM light;
+SELECT light_softbox('key', ROW(5.2, 4.6, -2.4)::vec3, ROW(0, 1, 0)::vec3,
+                     4.0, 4.0, 2, 125.0, ROW(1.00, 0.96, 0.88)::vec3, 22.0);
+SELECT render(48, 32, 1, 3);
+SELECT ok(md5(string_agg(r || ',' || g || ',' || b, ';' ORDER BY y, x))
+          = 'a772d990291da30643aa6d65b9b0aef1',
+          'an area-light frame matches its recorded hash') FROM img;
+
+-- What the feature is for, and what says it is unbiased, measured on the floor
+-- under the ball -- the deepest part of the shadow and the darkest thing in
+-- the frame.
+--
+-- A panel shrunk to almost nothing must reproduce the point light it replaced.
+-- That is the check worth having, because everything the sampling adds --
+-- nine rays where there was one, a hash per ray, a cosine, a 1/9 weight --
+-- has to cancel exactly when there is nothing to sample.  A stratification
+-- that drifted off the panel, or a weight that did not average, would show
+-- here as a shadow that is not the same shadow.
+DELETE FROM light;
+INSERT INTO light (name, p, col, pow, sky_k)
+VALUES ('key', ROW(5.2, 4.6, -2.4)::vec3, ROW(1.00, 0.96, 0.88)::vec3,
+        125.0, 22.0);
+SELECT render(64, 44, 1, 3);
+CREATE TEMP TABLE t_umbra AS
+SELECT min(r) AS dark, count(*) FILTER (WHERE r < 60) AS n FROM img WHERE y >= 26;
+
+DELETE FROM light;
+SELECT light_softbox('key', ROW(5.2, 4.6, -2.4)::vec3, ROW(0, 1, 0)::vec3,
+                     0.05, 0.05, 3, 125.0, ROW(1.00, 0.96, 0.88)::vec3, 22.0);
+SELECT render(64, 44, 1, 3);
+SELECT ok(tiny.dark = pt.dark AND tiny.n = pt.n,
+          'a panel shrunk to a point casts the shadow a point light casts')
+FROM t_umbra AS pt,
+     LATERAL (SELECT min(r) AS dark, count(*) FILTER (WHERE r < 60) AS n
+              FROM img WHERE y >= 26) AS tiny;
+
+-- Grown, the same emitter eats its own umbra: fewer pixels are fully in
+-- shadow, and the darkest of them is no longer as dark, because most of the
+-- panel is still visible from inside what used to be the shadow.
+DELETE FROM light;
+SELECT light_softbox('key', ROW(5.2, 4.6, -2.4)::vec3, ROW(0, 1, 0)::vec3,
+                     6.0, 6.0, 3, 125.0, ROW(1.00, 0.96, 0.88)::vec3, 22.0);
+SELECT render(64, 44, 1, 3);
+SELECT ok(big.n < pt.n AND big.dark > pt.dark,
+          'a panel with area eats the umbra a point light leaves')
+FROM t_umbra AS pt,
+     LATERAL (SELECT min(r) AS dark, count(*) FILTER (WHERE r < 60) AS n
+              FROM img WHERE y >= 26) AS big;
+DROP TABLE t_umbra;
+
+SELECT scene_default();
 
 \echo
 \echo == inlining ==
