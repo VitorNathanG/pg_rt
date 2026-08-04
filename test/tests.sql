@@ -1189,8 +1189,39 @@ SELECT light_softbox('key', ROW(5.2, 4.6, -2.4)::vec3, ROW(0, 1, 0)::vec3,
                      4.0, 4.0, 2, 125.0, ROW(1.00, 0.96, 0.88)::vec3, 22.0);
 SELECT render(48, 32, 1, 3);
 SELECT ok(md5(string_agg(r || ',' || g || ',' || b, ';' ORDER BY y, x))
-          = 'a772d990291da30643aa6d65b9b0aef1',
+          = 'a22f92cc84cec144b84087cb0c1c81ac',
           'an area-light frame matches its recorded hash') FROM img;
+
+-- A frame is a function of the scene, not of the session that built it.
+--
+-- The jitter is keyed on the light's position, and the obvious alternative --
+-- its light_id -- is wrong for a reason that hides well: an identity column
+-- counts how many rows have ever been inserted, so the same softbox described
+-- the same way samples the light differently depending on what else the
+-- connection did first.  It was caught by the suite's golden hashes disagreeing
+-- with the identical render from a fresh psql, which is a bad way to find out.
+DELETE FROM light;
+SELECT light_softbox('again', ROW(5.2, 4.6, -2.4)::vec3, ROW(0, 1, 0)::vec3,
+                     3.0, 3.0, 2, 125.0);
+SELECT render(48, 32, 1, 3);
+CREATE TEMP TABLE t_seq AS
+SELECT md5(string_agg(r || ',' || g || ',' || b, ';' ORDER BY y, x)) AS h FROM img;
+
+DELETE FROM light;
+SELECT light_softbox('burn', ROW(1, 1, 1)::vec3, ROW(0, 0, 0)::vec3, 1, 1, 1, 1);
+DELETE FROM light;
+SELECT light_softbox('again', ROW(5.2, 4.6, -2.4)::vec3, ROW(0, 1, 0)::vec3,
+                     3.0, 3.0, 2, 125.0);
+SELECT ok((SELECT count(DISTINCT light_id) FROM light) = 1
+      AND (SELECT light_id FROM light) > 1,
+          'the second light really did get a different id');
+SELECT render(48, 32, 1, 3);
+SELECT ok(t_seq.h = again.h,
+          'the same softbox renders the same frame whatever its row id is')
+FROM t_seq,
+     LATERAL (SELECT md5(string_agg(r || ',' || g || ',' || b, ';' ORDER BY y, x))
+              AS h FROM img) AS again;
+DROP TABLE t_seq;
 
 -- What the feature is for, and what says it is unbiased, measured on the floor
 -- under the ball -- the deepest part of the shadow and the darkest thing in
@@ -1461,6 +1492,14 @@ DELETE FROM light WHERE name = 'fill';
 -- its coarse sample away and re-samples on exactly the grid a uniform render
 -- would have used, so there is no third value anywhere in the image and no
 -- tolerance anywhere in this file.
+--
+-- It got sharper when the key light became a panel.  A refined pixel is traced
+-- in a pass that carries only the refined pixels, so its hits are numbered
+-- differently than the same samples are in a uniform frame -- and an area light
+-- keyed on the hit *id* would therefore sample the light somewhere else and
+-- break this outright, at 588 of these 1536 pixels.  Keying on the hit's
+-- position instead is what keeps it true, because a re-traced sample lands on
+-- the same point to the last bit.
 --
 -- It is also the check that would catch the mistake worth worrying about.
 -- Keeping the coarse sample instead of discarding it, or dividing by the wrong

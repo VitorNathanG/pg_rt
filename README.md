@@ -30,7 +30,7 @@ whose neighbours disagreed with them, which were traced again at four. That is
 ```bash
 docker compose up -d      # PostgreSQL 17
 ./load.sh                 # install the engine and build the default scene
-./test.sh                 # 200 checks on the codecs, the geometry and the optics
+./test.sh                 # 202 checks on the codecs, the geometry and the optics
 ./render.sh 600 400 2 5   # width height samples-per-axis max-depth -> out.png
 ```
 
@@ -126,8 +126,13 @@ alone. That per-hit part is the whole difference from spreading sixteen point
 lights over the same rectangle, which costs the same and bands, because every
 pixel in the frame would be summing the identical sixteen rows.
 
+The jitter is keyed on **where** the hit is rather than on which row it is, and
+that is what keeps a frame reproducible: a re-traced camera sample lands on the
+same intersection to the last bit, so a pixel that adaptive sampling refines is
+still bit-for-bit the pixel a uniform render would have produced.
+
 The cost is `samples²` shadow rays per lit hit and nothing else: transport does
-not change, and a scene with no area light in it pays 2.4% for the machinery.
+not change, and a scene with no area light in it pays about 2% for the machinery.
 Buy softness with `samples` rather than with `aa` — the samples inside one hit
 are stratified and the ones spread across sub-samples are not, so at equal ray
 count `samples 4, aa 1` is both cleaner and four times faster than
@@ -495,7 +500,7 @@ once.
 | `sql/05_trace.sql` | Fresnel, absorption, direct lighting, ray spawning |
 | `sql/06_render.sql` | camera, tone mapping, the bounce loop |
 | `sql/07_frame.sql` | the frame table, the render that stores its result, the queue |
-| `test/tests.sql` | 200 checks |
+| `test/tests.sql` | 202 checks |
 | `examples/` | a torus OBJ, the scene that loads it, a camera orbit and its GIF, a moving scene |
 | [`research/`](research) | the measurements behind the design |
 

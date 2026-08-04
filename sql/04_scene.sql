@@ -83,6 +83,29 @@ CREATE TABLE light (
   CHECK (samples >= 1)
 );
 
+-- A number that identifies a hit by *where it is* rather than by which row it
+-- happens to be.
+--
+-- The obvious key for the jitter below is the hit id, and it is wrong in a way
+-- that takes a while to surface.  `rt_hit.hid` is a bigserial, so it depends on
+-- how many rays came before -- and adaptive sampling re-traces a subset of the
+-- frame, which gives every re-traced hit a different id than the same sample
+-- had in a uniform render.  Keyed on the id, a refined pixel samples the light
+-- somewhere else and stops being bit-for-bit the pixel a uniform frame would
+-- have produced.  Measured at 48x32: 588 of 1536 pixels.
+--
+-- A hit's position does not have that problem.  The same camera sample re-traced
+-- produces the same intersection to the last bit, so this is stable under
+-- re-tracing, while neighbouring pixels -- and the sub-samples within one pixel
+-- -- land far enough apart to hash independently.  The multipliers are the usual
+-- large primes and the quantisation is 1e-5 world units, which is two orders
+-- finer than the closest two samples ever get.
+CREATE FUNCTION hit_seed(hx float8, hy float8, hz float8) RETURNS bigint AS $$
+  SELECT (round(hx * 1e5)::bigint * 73856093)
+       # (round(hy * 1e5)::bigint * 19349663)
+       # (round(hz * 1e5)::bigint * 83492791)
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
 -- Where on the emitter one hit should look, once per sample.
 --
 -- The grid is stratified rather than random: sample s takes cell
@@ -96,17 +119,26 @@ CREATE TABLE light (
 -- adjacent pixels, or two sub-samples of one pixel, look at different parts of
 -- the light and their average covers more of it than either alone.
 --
+-- `seed` is hit_seed() of the point being shaded, and the light's own position
+-- is mixed in so that two lights do not put their samples in the same places.
+-- Its *position* and not its light_id: an identity column counts how many rows
+-- have ever been inserted, so keying on it would make a frame depend on the
+-- history of the session that built the scene rather than on the scene.  That
+-- is not hypothetical -- it was caught by the suite's golden hashes disagreeing
+-- with the same render from a fresh connection.
+--
 -- The renderer does NOT call this; it inlines the same arithmetic into the
 -- shadow-ray CTAS, for the reason sky() is not called either -- a function
 -- invocation per shadow ray costs more than the arithmetic in it.  This is the
 -- scalar spelling, so a light's sample pattern can be plotted from psql, and
 -- the test suite holds the two to the same answers.
-CREATE FUNCTION light_sample(l light, hid bigint)
+CREATE FUNCTION light_sample(l light, seed bigint)
 RETURNS TABLE (s int, p vec3) AS $$
   SELECT g.s, l.p + l.u * a.su + l.v * a.sv
   FROM generate_series(0, l.samples * l.samples - 1) AS g(s)
        CROSS JOIN LATERAL (
-         SELECT hashint8(hid * 1000003 + g.s)) AS q(w)
+         SELECT hashint8(seed + hit_seed((l.p).x, (l.p).y, (l.p).z)
+                         + g.s)) AS q(w)
        CROSS JOIN LATERAL (
          SELECT 2.0 * ((g.s % l.samples)::float8
                        + ((q.w & 65535)::float8 + 0.5) / 65536.0)

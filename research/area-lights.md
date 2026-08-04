@@ -48,12 +48,46 @@ Three properties of that choice, each of which was needed:
 * **Hashed rather than random**, so it is IMMUTABLE (the planner may hoist and
   parallelise it) and reproducible (a frame is still a function of the scene,
   which is what the golden hashes rely on).
-* **Keyed on the hit**, so two hits look at different parts of the panel. This
-  is the entire point. Without it this is `N^2` point lights with extra steps.
+* **Keyed on where the hit is**, so two hits look at different parts of the
+  panel. This is the entire point -- without it this is `N^2` point lights with
+  extra steps -- and *where* rather than *which* is not a detail. See below.
 
 `nrm` being NULL for a point light is load-bearing and every reader tests for
 it explicitly, because `greatest(NULL, 0.0)` is `0.0` -- folding the cosine in
 the tidy way would switch every point light in the scene off in silence.
+
+## The key has to be the geometry, not the row
+
+The obvious identifier for a hit is `rt_hit.hid`, and it breaks two things that
+matter, neither of them visibly.
+
+**Adaptive sampling stops being exact.** `hid` is a bigserial, so it counts the
+rays that came before it. A refined pixel is traced in a second pass carrying
+only the refined pixels, so its hits are numbered differently than the same
+samples are in a uniform frame -- and keyed on the number, they sample the light
+somewhere else. The suite's strongest image check is that every pixel of an
+adaptive frame is bit-for-bit a pixel of one of the two uniform frames it sits
+between; with the light keyed on `hid` that failed at **588 of 1536 pixels**.
+Not a tolerance problem. The property was gone.
+
+**A frame stops being a function of its scene.** The first fix mixed the
+light's `light_id` into the hash so that two lights would not put their samples
+in the same places. `light_id` is an identity column, which counts how many rows
+have ever been inserted -- so the same softbox, described the same way, rendered
+differently depending on what else the connection had done first. This one
+announced itself by the suite's golden hashes disagreeing with the identical
+render from a fresh `psql`, which is a bad way to find out and was luck.
+
+Both are the same mistake: a *sequence number* is not an identity, it is a
+record of history. The fix is to key on content. `hit_seed()` hashes the hit's
+position quantised to 1e-5 world units, and the light contributes the same hash
+of its own position. A re-traced camera sample lands on the same intersection to
+the last bit, so this is stable under re-tracing; neighbouring pixels, and the
+sub-samples inside one pixel, land far enough apart to hash independently.
+
+Two checks now hold it: the adaptive-frame equality above, and a render of one
+softbox compared against a render of the same softbox inserted after some other
+rows had bumped the sequence.
 
 ## What it costs when nothing uses it
 
@@ -63,15 +97,16 @@ golden hashes are unchanged -- and the shadow ray count is unchanged at 82 852.
 
 | | shadow phase | frame |
 |---|---|---|
-| before | 848 ms | 7 250 ms |
+| before | 847 ms | 7 280 ms |
 | carrying the sampled point through `rt_sray` | 862 ms | |
 | + the `generate_series` over samples | 888 ms | |
-| + the hash and the stratified arithmetic | 978 ms | 7 428 ms |
+| + the hash and the stratified arithmetic | 989 ms | 7 419 ms |
 
-**+15% of the shadow phase, +2.4% of the frame.** Nearly all of it is the
-sample arithmetic rather than the plumbing; guarding the hash behind
-`nrm IS NOT NULL` recovered about 5 ms, which is noise, so the branch is not
-there.
+**+17% of the shadow phase, about 2% of the frame**, interleaved over three
+rounds. Nearly all of it is the sample arithmetic rather than the plumbing, and
+the whole of it is skipped for a light with no extent -- the sampling sits
+behind a `CASE WHEN l.nrm IS NOT NULL`, which is why moving the key from a
+column read to two `hit_seed()` calls did not change this number.
 
 Two shapes were tried and are slower, both measured on the same frame:
 

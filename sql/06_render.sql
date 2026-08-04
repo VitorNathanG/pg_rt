@@ -477,7 +477,9 @@ BEGIN
          -- this that a scene with no area light would otherwise pay for.
          CROSS JOIN LATERAL (
            SELECT CASE WHEN l.nrm IS NOT NULL
-                       THEN hashint8(h.hid::bigint * 1000003 + g.s)
+                       THEN hashint8(hit_seed(h.hx, h.hy, h.hz)
+                                     + hit_seed((l.p).x, (l.p).y, (l.p).z)
+                                     + g.s)
                        ELSE 0 END OFFSET 0) AS q(w)
          CROSS JOIN LATERAL (
            SELECT 2.0 * ((g.s % l.samples)::float8
