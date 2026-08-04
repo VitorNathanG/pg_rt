@@ -50,6 +50,16 @@ CREATE OR REPLACE FUNCTION m_floor() RETURNS material
 CREATE OR REPLACE FUNCTION l_key() RETURNS light
   AS $$ SELECT * FROM light WHERE name = 'key' $$ LANGUAGE sql STABLE;
 
+-- The same light as a point, for the handful of checks that are about a point
+-- specifically.  The default scene's key is a panel, so l_key() carries an
+-- extent, a facing and a sample count, and a check that wants to say something
+-- about a light with none of those has to say which light it means.
+CREATE OR REPLACE FUNCTION l_pt() RETURNS light AS $$
+  SELECT ROW(1, 'pt', v3(5.2, 4.6, -2.4), v3(1.00, 0.96, 0.88), 125.0,
+             22.0, 420.0, v3_unit(v3(5.2, 4.6, -2.4)),
+             v3(0,0,0), v3(0,0,0), 1, NULL)::light
+$$ LANGUAGE sql IMMUTABLE;
+
 -- A hit on the glass block and one on the metal ball, straight down onto the
 -- top of each, so the transport checks have real geometry underneath them.
 CREATE OR REPLACE FUNCTION h_glass() RETURNS hit
@@ -1040,12 +1050,12 @@ FROM (SELECT ROW(1.0, (m_floor()).mat_id, v3(-6,0,4), v3(0,1,0), false)::hit) AS
 -- -- several rows sampling one emitter -- add up to the emitter it samples,
 -- and it is the property the renderer leans on when it sums pairs.
 SELECT ok(near(v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_half, v3(1,1,1))) * 2.0,
-               v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_key(), v3(1,1,1)))),
+               v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_pt(), v3(1,1,1)))),
           'diffuse radiance is linear in the light power')
 FROM (SELECT ROW(1.0, (m_floor()).mat_id, v3(-6,0,4), v3(0,1,0), false)::hit) AS q(h),
-     LATERAL (SELECT ROW((l_key()).light_id, 'half', (l_key()).p, (l_key()).col,
-                         (l_key()).pow / 2.0, 0.0, 420.0,
-                         (l_key()).sky_dir,
+     LATERAL (SELECT ROW((l_pt()).light_id, 'half', (l_pt()).p, (l_pt()).col,
+                         (l_pt()).pow / 2.0, 0.0, 420.0,
+                         (l_pt()).sky_dir,
                          v3(0,0,0), v3(0,0,0), 1, NULL)::light) AS u(l_half);
 
 -- The sky disc must sit where the light does, because that is the whole reason
@@ -1122,8 +1132,8 @@ SELECT ok((SELECT array_agg(p ORDER BY s) FROM light_sample(l_box(), 7))
 
 -- A point light has one place to be sampled, and the extent arithmetic must
 -- leave it exactly there rather than near it.
-SELECT ok((SELECT count(*) FROM light_sample(l_key(), 7)) = 1
-      AND (SELECT p FROM light_sample(l_key(), 7)) = (l_key()).p,
+SELECT ok((SELECT count(*) FROM light_sample(l_pt(), 7)) = 1
+      AND (SELECT p FROM light_sample(l_pt(), 7)) = (l_pt()).p,
           'a point light samples its own position, exactly');
 
 -- The aim is the part with a sign in it, and a panel facing away from its
@@ -1170,11 +1180,11 @@ FROM (SELECT ROW(1.0, (m_floor()).mat_id, v3(0,0,0), v3(0,0,1), false)::hit)
 SELECT ok(near(v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_wide,
                                  (l_wide).p, v3(1,1,1)))
                * 9.0,
-               v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_key(), v3(1,1,1)))),
+               v3_maxc(light_rad(v3(0,-1,0), h, m_floor(), l_pt(), v3(1,1,1)))),
           'nine samples of one emitter add up to the emitter')
 FROM (SELECT ROW(1.0, (m_floor()).mat_id, v3(-6,0,4), v3(0,1,0), false)::hit) AS q(h),
-     LATERAL (SELECT ROW((l_key()).light_id, 'wide', (l_key()).p, (l_key()).col,
-                         (l_key()).pow, 0.0, 420.0, (l_key()).sky_dir,
+     LATERAL (SELECT ROW((l_pt()).light_id, 'wide', (l_pt()).p, (l_pt()).col,
+                         (l_pt()).pow, 0.0, 420.0, (l_pt()).sky_dir,
                          v3(0,0,0), v3(0,0,0), 3, NULL)::light) AS u(l_wide);
 
 SELECT ok(raises($$INSERT INTO light (name, p, samples) VALUES ('none', v3(1,1,1), 0)$$),
@@ -1357,7 +1367,7 @@ SELECT ok(plan_of('SELECT box_hit(t.ox,t.oy,t.oz,t.ivx,t.ivy,t.ivz,
 -- order the per-pixel float8 sums accumulate in is fixed.
 SELECT render(48, 32, 1, 3);
 SELECT ok(md5(string_agg(r || ',' || g || ',' || b, ';' ORDER BY y, x))
-          = '639c30aadec4eff915bfb48f62f38909',
+          = '26217a985f0d81003f5c0e7ffc088278',
           'a one-sample frame matches its recorded hash') FROM img;
 
 -- The second render is not a bigger copy of the first, and the divisor is why.
@@ -1368,7 +1378,7 @@ SELECT ok(md5(string_agg(r || ',' || g || ',' || b, ';' ORDER BY y, x))
 -- which left the expression that turns samples into a pixel unwitnessed.
 SELECT render(48, 32, 2, 3);
 SELECT ok(md5(string_agg(r || ',' || g || ',' || b, ';' ORDER BY y, x))
-          = '287fdd3fdb6e14059d52826bd4966bf8',
+          = 'fca176a962dc79af6939314eb250d672',
           'a four-sample frame matches its recorded hash') FROM img;
 
 SELECT render(24, 16, 1, 3);
@@ -1396,11 +1406,21 @@ SELECT ok(png_unfilter(png_scanlines('img'), 24, 16)
           'both filter-choosing modes reconstruct the same pixels');
 
 -- The default measures rather than predicts, so it can never be beaten by
--- either of the candidates it chose between.
-SELECT ok(length(deflate(png_scanlines('img'), 6))
-          <= least(length(deflate(png_scanlines('img', 0), 6)),
-                   length(deflate(png_scanlines('img', 1), 6))),
-          'the chosen filter is no worse than either candidate');
+-- either of the candidates it chose between -- at the level it measured them
+-- at, which is the whole of the guarantee and is worth spelling out.
+--
+-- png_scanlines trials both candidates at deflate level 1 for speed, and
+-- png_encode then writes the winner at level 6.  Those two can disagree.  On a
+-- soft-shadowed 24x16 frame they do: `none` wins the trial at 794 bytes
+-- against 805, and at level 6 `sub` would have come out 2 bytes smaller, 791
+-- against 793.  Two bytes in 793 is not worth trialling at level 6 -- that is
+-- the expensive half of the encoder run twice -- but it does mean the strong
+-- claim belongs at level 1, where it holds by construction, rather than at 6,
+-- where it is merely usually true.
+SELECT ok(length(deflate(png_scanlines('img'), 1))
+          <= least(length(deflate(png_scanlines('img', 0), 1)),
+                   length(deflate(png_scanlines('img', 1), 1))),
+          'the chosen filter is no worse than either candidate it measured');
 
 SELECT ok(bool_and(ft BETWEEN 0 AND 4), 'every scanline carries a legal filter byte')
 FROM generate_series(0, 15) AS y,

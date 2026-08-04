@@ -246,9 +246,26 @@ BEGIN
   -- comes out looking flat.  It is the only light carrying a sky disc, so the
   -- highlight the chrome ball reflects is the light that is actually shading
   -- the floor.
-  INSERT INTO light (name, p, col, pow, sky_k)
-  VALUES ('key', ROW(5.2, 4.6, -2.4)::vec3, ROW(1.00, 0.96, 0.88)::vec3,
-          125.0, 22.0);
+  --
+  -- A two-unit panel rather than a point, aimed at what the default camera is
+  -- aimed at.  Two samples per axis is four shadow rays per lit hit and costs
+  -- about 60% of a frame at one sample per pixel; at the aa = 2 that render.sh
+  -- defaults to, the four sub-samples of a pixel are four separate hits looking
+  -- at four different parts of the panel, so a pixel averages sixteen points on
+  -- the light and the grain measures lower than the point light's own checker
+  -- aliasing.  Raise `samples` if a frame is wanted clean at aa = 1.
+  --
+  -- sky_e is derived from the size rather than chosen.  The disc is a cos^n
+  -- lobe, which is at half brightness at sqrt(2 ln 2 / n) radians, and the
+  -- panel is atan(1.0 / 7.35) = 0.135 radians across from the origin -- so
+  -- n = 2 ln 2 / 0.135^2, about 80.  Left at the point light's 420 the ball
+  -- would reflect a pinpoint from a source a hundred times that wide, which is
+  -- the one place the sky disc's distant-sun approximation shows.
+  PERFORM light_softbox('key',
+                        ROW(5.2, 4.6, -2.4)::vec3,   -- where it is
+                        ROW(0.05, 1.0, 0.0)::vec3,   -- what it aims at
+                        2.0, 2.0, 2, 125.0,
+                        ROW(1.00, 0.96, 0.88)::vec3, 22.0, 80.0);
 
   INSERT INTO material (name, kind, albedo, albedo2, checker, f0, kr_max)
   VALUES ('checker-tile', mat_diffuse(),

@@ -109,7 +109,9 @@ background as well as on the surfaces it lights. Keeping that on the light
 rather than in the sky is what holds the two consistent: move the light and its
 reflection moves with it.
 
-A light can also have a size, which is what makes a shadow soft:
+A light can also have a size, which is what makes a shadow soft. The default
+scene's key is a two-unit panel rather than a point, so this is what
+`./render.sh` above is already doing:
 
 ```sql
 SELECT light_softbox('key', ROW(5.2, 4.6, -2.4)::vec3,  -- where it is
@@ -132,7 +134,8 @@ same intersection to the last bit, so a pixel that adaptive sampling refines is
 still bit-for-bit the pixel a uniform render would have produced.
 
 The cost is `samples²` shadow rays per lit hit and nothing else: transport does
-not change, and a scene with no area light in it pays about 2% for the machinery.
+not change, and a scene with no area light in it pays about 2% for the
+machinery.
 Buy softness with `samples` rather than with `aa` — the samples inside one hit
 are stratified and the ones spread across sub-samples are not, so at equal ray
 count `samples 4, aa 1` is both cleaner and four times faster than
